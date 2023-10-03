@@ -136,9 +136,10 @@ get_streams(DB, TopicFilter, StartTime) ->
     lists:flatmap(
       fun(Shard) ->
               Streams = emqx_ds_replication_layer:get_streams(Shard, TopicFilter, StartTime),
-              [{Rank, #stream{ shard = Shard
-                             , enc = I
-                             }} || {Rank, I} <- Streams]
+              [{add_shard_to_rank(Shard, Rank),
+                #stream{ shard = Shard
+                       , enc = I
+                       }} || {Rank, I} <- Streams]
       end,
       Shards).
 
@@ -171,3 +172,6 @@ next(#iterator{shard = Shard, enc = Iter0}, BatchSize) ->
 %%================================================================================
 %% Internal functions
 %%================================================================================
+
+add_shard_to_rank(Shard, {RankX, RankY}) ->
+    {[Shard | RankX], RankY}.

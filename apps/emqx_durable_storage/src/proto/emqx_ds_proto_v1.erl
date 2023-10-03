@@ -17,8 +17,9 @@
 
 -behavior(emqx_bpapi).
 
+-include_lib("emqx/include/bpapi.hrl").
 %% API:
--export([]).
+-export([open_shard/3, get_streams/4, open_iterator/4, next/4]).
 
 %% behavior callbacks:
 -export([introduced_in/0]).
@@ -27,10 +28,10 @@
 %% API funcions
 %%================================================================================
 
--spec create_shard(node(), emqx_ds_replication_layer:shard(), emqx_ds:create_db_opts()) ->
+-spec open_shard(node(), emqx_ds_replication_layer:shard(), emqx_ds:create_db_opts()) ->
           ok.
-create_shard(Node, Shard, Opts) ->
-    erpc:call(Node, emqx_ds_replication_layer, do_create_shard_v1, [Shard, Opts]).
+open_shard(Node, Shard, Opts) ->
+    erpc:call(Node, emqx_ds_replication_layer, do_open_shard_v1, [Shard, Opts]).
 
 -spec get_streams(node(), emqx_ds_replication_layer:shard(), emqx_ds:topic_filter(), emqx_ds:time()) ->
           [emqx_ds_replication_layer:stream()].

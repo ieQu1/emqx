@@ -72,7 +72,7 @@ open_db(DB, Opts) ->
     {ok, [message_id()]} | {error, _}.
 message_store(DB, Msg, Opts) ->
     %% TODO: milestone 5. Currently we store messages locally.
-    Shard = term_to_binary({DB, node()}),
+    Shard = shard_id(DB, node()),
     emqx_ds_storage_layer:message_store(Shard, Msg, Opts).
 
 -spec get_streams(shard(), emqx_ds:topic_filter(), emqx_ds:time()) -> [{emqx_ds:stream_rank(), stream()}].
@@ -109,16 +109,16 @@ next(Shard, Iter, BatchSize) ->
 
 -spec do_open_shard_v1(shard(), emqx_ds:create_db_opts()) -> ok.
 do_open_shard_v1(Shard, Opts) ->
-    emqx_ds_storage_layer_sup:ensure_shard(Shard, Opts).
+    emqx_ds_storage_layer:open_shard(Shard, Opts).
 
 -spec do_get_streams_v1(shard(), emqx_ds:topic_filter(), emqx_ds:time()) ->
           [{emqx_ds:stream_rank(), stream()}].
 do_get_streams_v1(Shard, TopicFilter, StartTime) ->
-    error({todo, Shard, TopicFilter, StartTime}).
+    emqx_ds_storage_layer:get_streams(Shard, TopicFilter, StartTime).
 
 -spec do_open_iterator_v1(shard(), stream(), emqx_ds:time()) -> iterator().
 do_open_iterator_v1(Shard, Stream, StartTime) ->
-    error({todo, Shard, Stream, StartTime}).
+    emqx_ds_storage_layer:make_iterator(Shard, Stream, StartTime).
 
 -spec do_next_v1(shard(), iterator(), non_neg_integer()) ->
           {ok, iterator(), [emqx_types:message()]} | end_of_stream.
@@ -141,4 +141,6 @@ node_of_shard(ShardId) ->
     binary_to_atom(NodeBin).
 
 list_nodes() ->
-    mria:running_nodes().
+    %% TODO:
+    [node()|nodes()].
+    %mria:running_nodes().

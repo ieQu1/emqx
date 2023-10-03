@@ -9,11 +9,11 @@
 -export([start_link/2]).
 -export([create_generation/3]).
 
--export([get_streams/3]).
+-export([open_shard/2, get_streams/3]).
 -export([message_store/3]).
 -export([delete/4]).
 
--export([make_iterator/2, next/1, next/2]).
+-export([make_iterator/3, next/1, next/2]).
 
 -export([
     preserve_iterator/2,
@@ -25,7 +25,7 @@
     foldl_iterator_prefix/4
 ]).
 
-%% behaviour callbacks:
+%% gen_server callbacks:
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([stream/0, cf_refs/0, gen_id/0, options/0, state/0, iterator/0]).
@@ -135,7 +135,7 @@
     ok | {error, _}.
 
 -callback get_streams(_DB, emqx_ds:topic_filter(), emqx_ds:time()) ->
-    [_Stream].
+    [{_TopicRankX, _Stream}].
 
 -callback make_iterator(_DB, emqx_ds:replay()) ->
     {ok, _It} | {error, _}.
@@ -147,25 +147,23 @@
 -callback next(It) -> {value, binary(), It} | none | {error, closed}.
 
 %%================================================================================
-%% API funcions
+%% Replication layer API
 %%================================================================================
 
--spec start_link(emqx_ds:shard(), emqx_ds_storage_layer:options()) ->
-    {ok, pid()}.
-start_link(Shard, Options) ->
-    gen_server:start_link(?REF(Shard), ?MODULE, {Shard, Options}, []).
+-spec open_shard(emqx_ds_replication_layer:shard(), emqx_ds_storage_layer:options()) -> ok.
+open_shard(Shard, Options) ->
+    emqx_ds_storage_layer_sup:ensure_shard(Shard, Options).
 
--spec get_streams(emqx_ds:shard_id(), emqx_ds:topic_filter(), emqx_ds:time()) -> [_Stream].
-get_streams(_ShardId, _TopicFilter, _StartTime) ->
-    [].
-
-
--spec create_generation(
-    emqx_ds:shard(), emqx_ds:time(), emqx_ds_conf:backend_config()
-) ->
-    {ok, gen_id()} | {error, nonmonotonic}.
-create_generation(ShardId, Since, Config = {_Module, _Options}) ->
-    gen_server:call(?REF(ShardId), {create_generation, Since, Config}).
+-spec get_streams(emqx_ds:shard_id(), emqx_ds:topic_filter(), emqx_ds:time()) -> [{emqx_ds:stream_rank(), _Stream}].
+get_streams(Shard, TopicFilter, StartTime) ->
+    %% TODO: lookup ALL generations
+    {GenId, #{module := Mod, data := ModState}} = meta_lookup_gen(Shard, StartTime),
+    lists:map(
+        fun({RankX, Stream}) ->
+                Rank = {RankX, GenId},
+                {Rank, Stream}
+        end,
+      Mod:get_streams(ModState, TopicFilter, StartTime)).
 
 -spec message_store(emqx_ds:shard(), [emqx_types:message()], emqx_ds:message_store_opts()) ->
                            {ok, _MessageId} | {error, _}.
@@ -182,22 +180,6 @@ message_store(Shard, Msgs, _Opts) ->
            end,
            Msgs)}.
 
--spec delete(emqx_ds:shard(), emqx_guid:guid(), emqx_ds:time(), emqx_ds:topic()) ->
-    ok | {error, _}.
-delete(Shard, GUID, Time, Topic) ->
-    {_GenId, #{module := Mod, data := Data}} = meta_lookup_gen(Shard, Time),
-    Mod:delete(Data, GUID, Time, Topic).
-
--spec make_iterator(emqx_ds:shard(), emqx_ds:replay()) ->
-    {ok, iterator()} | {error, _TODO}.
-make_iterator(Shard, Replay = {_, StartTime}) ->
-    {GenId, Gen} = meta_lookup_gen(Shard, StartTime),
-    open_iterator(Gen, #it{
-        shard = Shard,
-        gen = GenId,
-        replay = Replay
-    }).
-
 -spec next(iterator()) -> {ok, iterator(), [binary()]} | end_of_stream.
 next(It = #it{}) ->
     next(It, _BatchSize = 1).
@@ -213,6 +195,33 @@ next(
     next(It#it{data = ItData}, BatchSize);
 next(It = #it{}, BatchSize) ->
     do_next(It, BatchSize, _Acc = []).
+
+%%================================================================================
+%% API functions
+%%================================================================================
+
+-spec create_generation(
+    emqx_ds:shard(), emqx_ds:time(), emqx_ds_conf:backend_config()
+) ->
+    {ok, gen_id()} | {error, nonmonotonic}.
+create_generation(ShardId, Since, Config = {_Module, _Options}) ->
+    gen_server:call(?REF(ShardId), {create_generation, Since, Config}).
+
+-spec delete(emqx_ds:shard(), emqx_guid:guid(), emqx_ds:time(), emqx_ds:topic()) ->
+    ok | {error, _}.
+delete(Shard, GUID, Time, Topic) ->
+    {_GenId, #{module := Mod, data := Data}} = meta_lookup_gen(Shard, Time),
+    Mod:delete(Data, GUID, Time, Topic).
+
+-spec make_iterator(emqx_ds:shard(), _Stream, emqx_ds:time()) ->
+    {ok, iterator()} | {error, _TODO}.
+make_iterator(Shard, Stream, StartTime) ->
+    {GenId, Gen} = meta_lookup_gen(Shard, StartTime),
+    open_iterator(Gen, #it{
+        shard = Shard,
+        gen = GenId,
+        replay = Replay
+    }).
 
 -spec do_next(iterator(), non_neg_integer(), [binary()]) ->
     {ok, iterator(), [binary()]} | end_of_stream.
@@ -310,12 +319,17 @@ foldl_iterator_prefix(Shard, KeyPrefix, Fn, Acc) ->
     do_foldl_iterator_prefix(Shard, KeyPrefix, Fn, Acc).
 
 %%================================================================================
-%% behaviour callbacks
+%% gen_server
 %%================================================================================
+
+-spec start_link(emqx_ds:shard(), emqx_ds_storage_layer:options()) ->
+    {ok, pid()}.
+start_link(Shard, Options) ->
+    gen_server:start_link(?REF(Shard), ?MODULE, {Shard, Options}, []).
 
 init({Shard, Options}) ->
     process_flag(trap_exit, true),
-    {ok, S0} = open_db(Shard, Options),
+    {ok, S0} = do_open_db(Shard, Options),
     S = ensure_current_generation(S0),
     ok = populate_metadata(S),
     {ok, S}.
@@ -397,8 +411,8 @@ create_gen(GenId, Since, {Module, Options}, S = #s{db = DBHandle, cf_generations
     },
     {ok, Gen, S#s{cf_generations = NewCFs ++ CFs}}.
 
--spec open_db(emqx_ds:shard(), options()) -> {ok, state()} | {error, _TODO}.
-open_db(Shard, Options) ->
+-spec do_open_db(emqx_ds:shard(), options()) -> {ok, state()} | {error, _TODO}.
+do_open_db(Shard, Options) ->
     DefaultDir = binary_to_list(Shard),
     DBDir = unicode:characters_to_list(maps:get(dir, Options, DefaultDir)),
     %% TODO: properly forward keyspace
@@ -603,7 +617,7 @@ schema_gen_key(N) ->
 
 %% Functions for dealing with the runtime shard metadata:
 
--define(PERSISTENT_TERM(SHARD, GEN), {?MODULE, SHARD, GEN}).
+-define(PERSISTENT_TERM(SHARD, GEN), {emqx_ds_storage_layer, SHARD, GEN}).
 
 -spec meta_register_gen(emqx_ds:shard(), gen_id(), generation()) -> ok.
 meta_register_gen(Shard, GenId, Gen) ->
@@ -641,8 +655,8 @@ meta_get_current(Shard) ->
     meta_lookup(Shard, current, undefined).
 
 -spec meta_lookup(emqx_ds:shard(), _K) -> _V.
-meta_lookup(Shard, K) ->
-    persistent_term:get(?PERSISTENT_TERM(Shard, K)).
+meta_lookup(Shard, Key) ->
+    persistent_term:get(?PERSISTENT_TERM(Shard, Key)).
 
 -spec meta_lookup(emqx_ds:shard(), _K, Default) -> _V | Default.
 meta_lookup(Shard, K, Default) ->

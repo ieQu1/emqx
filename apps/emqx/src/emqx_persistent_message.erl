@@ -27,10 +27,6 @@
 ]).
 
 %% FIXME
--define(DS_SHARD_ID, <<"local">>).
--define(DEFAULT_KEYSPACE, default).
--define(DS_SHARD, {?DEFAULT_KEYSPACE, ?DS_SHARD_ID}).
-
 -define(WHEN_ENABLED(DO),
     case is_store_enabled() of
         true -> DO;
@@ -42,11 +38,11 @@
 
 init() ->
     ?WHEN_ENABLED(begin
-                      ok = emqx_ds:create_db(<<"default">>, #{}),
-        ok = emqx_persistent_session_ds_router:init_tables(),
-        ok = emqx_persistent_session_ds:create_tables(),
-        ok
-    end).
+                      ok = emqx_ds:open_db(<<"default">>, #{}),
+                      ok = emqx_persistent_session_ds_router:init_tables(),
+                      ok = emqx_persistent_session_ds:create_tables(),
+                      ok
+                  end).
 
 -spec is_store_enabled() -> boolean().
 is_store_enabled() ->
