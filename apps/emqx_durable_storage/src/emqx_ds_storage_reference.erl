@@ -41,25 +41,21 @@
 %%================================================================================
 
 %% Permanent state:
--record(schema,
-        {
-        }).
+-record(schema, {}).
 
 %% Runtime state:
--record(s,
-        { db :: rocksdb:db_handle()
-        , cf :: rocksdb:cf_handle()
-        }).
+-record(s, {
+    db :: rocksdb:db_handle(),
+    cf :: rocksdb:cf_handle()
+}).
 
--record(stream,
-        { topic_filter :: emqx_ds:topic_filter()
-        }).
+-record(stream, {topic_filter :: emqx_ds:topic_filter()}).
 
--record(it,
-        { topic_filter :: emqx_ds:topic_filter()
-        , start_time :: emqx_ds:time()
-        , last_seen_message_key = first :: binary() | first
-        }).
+-record(it, {
+    topic_filter :: emqx_ds:topic_filter(),
+    start_time :: emqx_ds:time(),
+    last_seen_message_key = first :: binary() | first
+}).
 
 %%================================================================================
 %% API funcions
@@ -81,20 +77,22 @@ open(_Shard, DBHandle, GenId, CFRefs, #schema{}) ->
 
 store_batch(_ShardId, #s{db = DB, cf = CF}, Messages, _Options) ->
     lists:foreach(
-      fun(Msg) ->
-              Key = integer_to_binary(erlang:unique_integer([monotonic])),
-              Val = term_to_binary(Msg),
-              rocksdb:put(DB, CF, Key, Val, [])
-      end,
-      Messages).
+        fun(Msg) ->
+            Key = integer_to_binary(erlang:unique_integer([monotonic])),
+            Val = term_to_binary(Msg),
+            rocksdb:put(DB, CF, Key, Val, [])
+        end,
+        Messages
+    ).
 
 get_streams(_Shard, _Data, TopicFilter, _StartTime) ->
     [#stream{topic_filter = TopicFilter}].
 
 make_iterator(_Shard, _Data, #stream{topic_filter = TopicFilter}, StartTime) ->
-    #it{ topic_filter = TopicFilter
-       , start_time = StartTime
-       }.
+    #it{
+        topic_filter = TopicFilter,
+        start_time = StartTime
+    }.
 
 next(_Shard, #s{db = DB, cf = CF}, It0, BatchSize) ->
     #it{topic_filter = TopicFilter, start_time = StartTime, last_seen_message_key = Key0} = It0,
@@ -116,7 +114,7 @@ do_next(TopicFilter, StartTime, IT, NLeft, Action, Key0, Acc) ->
             Msg = #message{topic = Topic, timestamp = TS} = binary_to_term(Blob),
             case emqx_topic:match(Topic, TopicFilter) andalso TS >= StartTime of
                 true ->
-                    do_next(TopicFilter, StartTime, IT, NLeft - 1, next, Key, [Msg|Acc]);
+                    do_next(TopicFilter, StartTime, IT, NLeft - 1, next, Key, [Msg | Acc]);
                 false ->
                     do_next(TopicFilter, StartTime, IT, NLeft, next, Key, Acc)
             end;

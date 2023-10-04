@@ -33,7 +33,18 @@
 %% Misc. API:
 -export([]).
 
--export_type([db/0, time/0, topic_filter/0, topic/0, stream/0, stream_rank/0, iterator/0]).
+-export_type([
+    db/0,
+    time/0,
+    topic_filter/0,
+    topic/0,
+    stream/0,
+    stream_rank/0,
+    iterator/0,
+    next_result/1, next_result/0,
+    store_batch_result/0,
+    make_iterator_result/1, make_iterator_result/0
+]).
 
 %%================================================================================
 %% Type declarations
@@ -53,6 +64,17 @@
 
 -opaque iterator() :: emqx_ds_replication_layer:iterator().
 
+-type store_batch_result() :: ok | {error, _}.
+
+-type make_iterator_result(Iterator) :: {ok, Iterator} | {error, _}.
+
+-type make_iterator_result() :: make_iterator_result(iterator()).
+
+-type next_result(Iterator) ::
+    {ok, Iterator, [emqx_types:message()]} | {ok, end_of_stream} | {error, _}.
+
+-type next_result() :: next_result(iterator()).
+
 %% Timestamp
 %% Earliest possible timestamp is 0.
 %% TODO granularity?  Currently, we should always use micro second, as that's the unit we
@@ -62,8 +84,8 @@
 -type message_store_opts() :: #{}.
 
 -type create_db_opts() ::
-        #{ %% TODO: keyspace
-         }.
+    %% TODO: keyspace
+    #{}.
 
 -type message_id() :: emqx_ds_replication_layer:message_id().
 
@@ -79,13 +101,11 @@
 open_db(DB, Opts) ->
     emqx_ds_replication_layer:open_db(DB, Opts).
 
--spec store_batch([emqx_types:message()]) ->
-          {ok, [message_id()]} | {error, _}.
+-spec store_batch([emqx_types:message()]) -> store_batch_result().
 store_batch(Msgs) ->
     store_batch(?DEFAULT_DB, Msgs, #{}).
 
--spec store_batch(db(), [emqx_types:message()], message_store_opts()) ->
-    {ok, [message_id()]} | {error, _}.
+-spec store_batch(db(), [emqx_types:message()], message_store_opts()) -> store_batch_result().
 store_batch(DB, Msgs, Opts) ->
     emqx_ds_replication_layer:store_batch(DB, Msgs, Opts).
 
@@ -131,11 +151,11 @@ store_batch(DB, Msgs) ->
 get_streams(DB, TopicFilter, StartTime) ->
     emqx_ds_replication_layer:get_streams(DB, TopicFilter, StartTime).
 
--spec make_iterator(stream(), time()) -> {ok, iterator()} | {error, _}.
+-spec make_iterator(stream(), time()) -> make_iterator_result().
 make_iterator(Stream, StartTime) ->
     emqx_ds_replication_layer:make_iterator(Stream, StartTime).
 
--spec next(iterator(), pos_integer()) -> {ok, iterator(), [emqx_types:message()]} | end_of_stream.
+-spec next(iterator(), pos_integer()) -> next_result().
 next(Iter, BatchSize) ->
     emqx_ds_replication_layer:next(Iter, BatchSize).
 

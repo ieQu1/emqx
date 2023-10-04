@@ -16,21 +16,21 @@
 -module(emqx_ds_replication_layer).
 
 -export([
-          list_shards/1,
-          open_db/2,
-          store_batch/3,
-          get_streams/3,
-          make_iterator/2,
-          next/2
-        ]).
-
+    list_shards/1,
+    open_db/2,
+    store_batch/3,
+    get_streams/3,
+    make_iterator/2,
+    next/2
+]).
 
 %% internal exports:
--export([ do_open_shard_v1/2,
-          do_get_streams_v1/3,
-          do_make_iterator_v1/3,
-          do_next_v1/3
-        ]).
+-export([
+    do_open_shard_v1/2,
+    do_get_streams_v1/3,
+    do_make_iterator_v1/3,
+    do_next_v1/3
+]).
 
 -export_type([shard_id/0, stream/0, iterator/0, message_id/0]).
 
@@ -49,17 +49,17 @@
 %% internal rocksdb storage. In t he future we want to add another
 %% implementations for emqx_ds, so this type has to take this into
 %% account.
--record(stream,
-        { shard :: emqx_ds_replication_layer:shard_id()
-        , enc :: emqx_ds_replication_layer:stream()
-        }).
+-record(stream, {
+    shard :: emqx_ds_replication_layer:shard_id(),
+    enc :: emqx_ds_replication_layer:stream()
+}).
 
 -opaque stream() :: stream().
 
--record(iterator,
-        { shard :: emqx_ds_replication_layer:shard_id()
-        , enc :: enqx_ds_replication_layer:iterator()
-        }).
+-record(iterator, {
+    shard :: emqx_ds_replication_layer:shard_id(),
+    enc :: enqx_ds_replication_layer:iterator()
+}).
 
 -opaque iterator() :: #iterator{}.
 
@@ -73,42 +73,49 @@
 list_shards(DB) ->
     %% TODO: milestone 5
     lists:map(
-      fun(Node) ->
-              shard_id(DB, Node)
-      end,
-      list_nodes()).
+        fun(Node) ->
+            shard_id(DB, Node)
+        end,
+        list_nodes()
+    ).
 
 -spec open_db(emqx_ds:db(), emqx_ds:create_db_opts()) -> ok.
 open_db(DB, Opts) ->
     lists:foreach(
-      fun(Node) ->
-              Shard = shard_id(DB, Node),
-              emqx_ds_proto_v1:open_shard(Node, Shard, Opts)
-      end,
-      list_nodes()).
+        fun(Node) ->
+            Shard = shard_id(DB, Node),
+            emqx_ds_proto_v1:open_shard(Node, Shard, Opts)
+        end,
+        list_nodes()
+    ).
 
 -spec store_batch(emqx_ds:db(), [emqx_types:message()], emqx_ds:message_store_opts()) ->
-    {ok, [message_id()]} | {error, _}.
+    emqx_ds:store_batch_result().
 store_batch(DB, Msg, Opts) ->
     %% TODO: Currently we store messages locally.
     Shard = shard_id(DB, node()),
     emqx_ds_storage_layer:store_batch(Shard, Msg, Opts).
 
--spec get_streams(db(), emqx_ds:topic_filter(), emqx_ds:time()) -> [{emqx_ds:stream_rank(), stream()}].
+-spec get_streams(db(), emqx_ds:topic_filter(), emqx_ds:time()) ->
+    [{emqx_ds:stream_rank(), stream()}].
 get_streams(DB, TopicFilter, StartTime) ->
     Shards = emqx_ds_replication_layer:list_shards(DB),
     lists:flatmap(
-      fun(Shard) ->
-              Node = node_of_shard(Shard),
-              Streams = emqx_ds_proto_v1:get_streams(Node, Shard, TopicFilter, StartTime),
-              [{add_shard_to_rank(Shard, Rank),
-                #stream{ shard = Shard
-                       , enc = I
-                       }} || {Rank, I} <- Streams]
-      end,
-      Shards).
+        fun(Shard) ->
+            Node = node_of_shard(Shard),
+            Streams = emqx_ds_proto_v1:get_streams(Node, Shard, TopicFilter, StartTime),
+            [
+                {add_shard_to_rank(Shard, Rank), #stream{
+                    shard = Shard,
+                    enc = I
+                }}
+             || {Rank, I} <- Streams
+            ]
+        end,
+        Shards
+    ).
 
--spec make_iterator(stream(), emqx_ds:time()) -> {ok, iterator()} | {error, _}.
+-spec make_iterator(stream(), emqx_ds:time()) -> emqx_ds:make_iterator_result(iterator()).
 make_iterator(Stream, StartTime) ->
     #stream{shard = Shard, enc = StorageStream} = Stream,
     Node = node_of_shard(Shard),
@@ -119,8 +126,7 @@ make_iterator(Stream, StartTime) ->
             Err
     end.
 
--spec next(iterator(), pos_integer()) ->
-          {ok, iterator(), [emqx_types:message()]} | end_of_stream.
+-spec next(iterator(), pos_integer()) -> emqx_ds:next_result(iterator()).
 next(Iter0, BatchSize) ->
     #iterator{shard = Shard, enc = StorageIter0} = Iter0,
     Node = node_of_shard(Shard),
@@ -153,16 +159,15 @@ do_open_shard_v1(Shard, Opts) ->
     emqx_ds_storage_layer:open_shard(Shard, Opts).
 
 -spec do_get_streams_v1(shard_id(), emqx_ds:topic_filter(), emqx_ds:time()) ->
-          [{integer(), _Stream}].
+    [{integer(), _Stream}].
 do_get_streams_v1(Shard, TopicFilter, StartTime) ->
     emqx_ds_storage_layer:get_streams(Shard, TopicFilter, StartTime).
 
--spec do_make_iterator_v1(shard_id(), _Stream, emqx_ds:time()) -> iterator().
+-spec do_make_iterator_v1(shard_id(), _Stream, emqx_ds:time()) -> {ok, iterator()} | {error, _}.
 do_make_iterator_v1(Shard, Stream, StartTime) ->
     emqx_ds_storage_layer:make_iterator(Shard, Stream, StartTime).
 
--spec do_next_v1(shard_id(), Iter, pos_integer()) ->
-          {ok, Iter, [emqx_types:message()]} | end_of_stream.
+-spec do_next_v1(shard_id(), Iter, pos_integer()) -> emqx_ds:next_result(Iter).
 do_next_v1(Shard, Iter, BatchSize) ->
     emqx_ds_storage_layer:next(Shard, Iter, BatchSize).
 
@@ -178,7 +183,7 @@ shard_id(DB, Node) ->
     %% TODO: don't bake node name into the schema, don't repeat the
     %% Mnesia's 1M$ mistake.
     NodeBin = atom_to_binary(Node),
-    <<DB/binary, ":",  NodeBin/binary>>.
+    <<DB/binary, ":", NodeBin/binary>>.
 
 -spec node_of_shard(shard_id()) -> node().
 node_of_shard(ShardId) ->

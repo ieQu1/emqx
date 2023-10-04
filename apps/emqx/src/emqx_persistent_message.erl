@@ -38,11 +38,11 @@
 
 init() ->
     ?WHEN_ENABLED(begin
-                      ok = emqx_ds:open_db(<<"default">>, #{}),
-                      ok = emqx_persistent_session_ds_router:init_tables(),
-                      ok = emqx_persistent_session_ds:create_tables(),
-                      ok
-                  end).
+        ok = emqx_ds:open_db(<<"default">>, #{}),
+        ok = emqx_persistent_session_ds_router:init_tables(),
+        %ok = emqx_persistent_session_ds:create_tables(),
+        ok
+    end).
 
 -spec is_store_enabled() -> boolean().
 is_store_enabled() ->
@@ -66,7 +66,7 @@ needs_persistence(Msg) ->
     not (emqx_message:get_flag(dup, Msg) orelse emqx_message:is_sys(Msg)).
 
 store_message(Msg) ->
-    emqx_ds:message_store([Msg]).
+    emqx_ds:store_batch([Msg]).
 
 has_subscribers(#message{topic = Topic}) ->
     emqx_persistent_session_ds_router:has_any_route(Topic).

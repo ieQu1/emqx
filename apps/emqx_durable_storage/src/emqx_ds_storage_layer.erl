@@ -39,20 +39,20 @@
 -type gen_id() :: 0..16#ffff.
 
 %% Note: this record might be stored permanently on a remote node.
--record(stream,
-        { generation :: gen_id()
-        , enc :: _EncapsultatedData
-        , misc = #{} :: map()
-        }).
+-record(stream, {
+    generation :: gen_id(),
+    enc :: _EncapsultatedData,
+    misc = #{} :: map()
+}).
 
 -opaque stream() :: #stream{}.
 
 %% Note: this record might be stored permanently on a remote node.
--record(it,
-        { generation :: gen_id()
-        , enc :: _EncapsultatedData
-        , misc = #{} :: map()
-        }).
+-record(it, {
+    generation :: gen_id(),
+    enc :: _EncapsultatedData,
+    misc = #{} :: map()
+}).
 
 -opaque iterator() :: #it{}.
 
@@ -114,7 +114,7 @@
     _Iterator.
 
 -callback next(shard_id(), _Data, Iter, pos_integer()) ->
-    {ok, Iter, [emqx_types:message()]}.
+    {ok, Iter, [emqx_types:message()]} | {error, _}.
 
 %%================================================================================
 %% API for the replication layer
@@ -124,40 +124,48 @@
 open_shard(Shard, Options) ->
     emqx_ds_storage_layer_sup:ensure_shard(Shard, Options).
 
--spec store_batch(shard_id(), [emqx_types:message()], emqx_ds:message_store_opts()) -> ok | {error, _}.
+-spec store_batch(shard_id(), [emqx_types:message()], emqx_ds:message_store_opts()) ->
+    emqx_ds:store_batch_result().
 store_batch(Shard, Messages, Options) ->
     %% We always store messages in the current generation:
     GenId = generation_current(Shard),
-    {_, #{module := Mod, data := GenData}} = generation_get(Shard, GenId),
+    #{module := Mod, data := GenData} = generation_get(Shard, GenId),
     Mod:store_batch(Shard, GenData, Messages, Options).
 
 -spec get_streams(shard_id(), emqx_ds:topic_filter(), emqx_ds:time()) ->
-          [{integer(), stream()}].
+    [{integer(), stream()}].
 get_streams(Shard, TopicFilter, StartTime) ->
     Gens = generations_since(Shard, StartTime),
     lists:flatmap(
-      fun({GenId, #{module := Mod, data := GenData}}) ->
-              Streams = Mod:get_streams(Shard, GenData, TopicFilter, StartTime),
-              [{GenId, #stream{ generation = GenId
-                              , enc = Stream
-                              }} || Stream <- Streams]
-      end,
-      Gens).
+        fun({GenId, #{module := Mod, data := GenData}}) ->
+            Streams = Mod:get_streams(Shard, GenData, TopicFilter, StartTime),
+            [
+                {GenId, #stream{
+                    generation = GenId,
+                    enc = Stream
+                }}
+             || Stream <- Streams
+            ]
+        end,
+        Gens
+    ).
 
--spec make_iterator(shard_id(), stream(), emqx_ds:time()) -> iterator().
+-spec make_iterator(shard_id(), stream(), emqx_ds:time()) ->
+    emqx_ds:make_iterator_result(iterator()).
 make_iterator(Shard, #stream{generation = GenId, enc = Stream}, StartTime) ->
     #{module := Mod, data := GenData} = generation_get(Shard, GenId),
     case Mod:make_iterator(Shard, GenData, Stream, StartTime) of
         {ok, Iter} ->
-            {ok, #it{ generation = GenId
-                    , enc = Iter
-                    }};
+            {ok, #it{
+                generation = GenId,
+                enc = Iter
+            }};
         {error, _} = Err ->
             Err
     end.
 
 -spec next(shard_id(), iterator(), pos_integer()) ->
-          {ok, iterator(), [emqx_types:message()]} | end_of_stream.
+    emqx_ds:next_result(iterator()).
 next(Shard, Iter = #it{generation = GenId, enc = GenIter0}, BatchSize) ->
     #{module := Mod, data := GenData} = generation_get(Shard, GenId),
     Current = generation_current(Shard),
@@ -166,9 +174,11 @@ next(Shard, Iter = #it{generation = GenId, enc = GenIter0}, BatchSize) ->
             %% This is a past generation. Storage layer won't write
             %% any more messages here. The iterator reached the end:
             %% the stream has been fully replayed.
-            end_of_stream;
+            {ok, end_of_stream};
         {ok, GenIter, Batch} ->
-            {ok, Iter#it{enc = GenIter}, Batch}
+            {ok, Iter#it{enc = GenIter}, Batch};
+        Error = {error, _} ->
+            Error
     end.
 
 %%================================================================================
@@ -198,8 +208,7 @@ start_link(Shard, Options) ->
 init({ShardId, Options}) ->
     process_flag(trap_exit, true),
     erase_schema_runtime(ShardId),
-    RocksdbOptions = [],
-    {ok, DB, CFRefs} = rocksdb_open(ShardId, RocksdbOptions),
+    {ok, DB, CFRefs} = rocksdb_open(ShardId, Options),
     {Schema, NewCFRefs} =
         case get_schema_persistent(DB) of
             not_found ->
@@ -208,12 +217,13 @@ init({ShardId, Options}) ->
                 {Scm, CFRefs}
         end,
     Shard = open_shard(ShardId, DB, CFRefs, Schema),
-    S = #s{ shard_id = ShardId
-          , db = DB
-          , cf_refs = NewCFRefs
-          , schema = Schema
-          , shard = Shard
-          },
+    S = #s{
+        shard_id = ShardId,
+        db = DB,
+        cf_refs = NewCFRefs,
+        schema = Schema,
+        shard = Shard
+    },
     commit_metadata(S),
     {ok, S}.
 
@@ -246,37 +256,41 @@ terminate(_Reason, #s{db = DB, shard_id = ShardId}) ->
 %%================================================================================
 
 -spec open_shard(shard_id(), rocksdb:db_handle(), cf_refs(), shard_schema()) ->
-          shard().
+    shard().
 open_shard(ShardId, DB, CFRefs, ShardSchema) ->
     %% Transform generation schemas to generation runtime data:
     maps:map(
-      fun({generation, GenId}, GenSchema) ->
-              open_generation(ShardId, DB, CFRefs, GenId, GenSchema);
-         (_K, Val) ->
-              Val
-      end,
-      ShardSchema).
+        fun
+            ({generation, GenId}, GenSchema) ->
+                open_generation(ShardId, DB, CFRefs, GenId, GenSchema);
+            (_K, Val) ->
+                Val
+        end,
+        ShardSchema
+    ).
 
 -spec open_generation(shard_id(), rocksdb:db_handle(), cf_refs(), gen_id(), generation_schema()) ->
-          generation().
+    generation().
 open_generation(ShardId, DB, CFRefs, GenId, GenSchema) ->
     #{module := Mod, data := Schema} = GenSchema,
     RuntimeData = Mod:open(ShardId, DB, GenId, CFRefs, Schema),
     GenSchema#{data => RuntimeData}.
 
 -spec create_new_shard_schema(shard_id(), rocksdb:db_handle(), cf_refs(), _Options) ->
-          {shard_schema(), cf_refs()}.
+    {shard_schema(), cf_refs()}.
 create_new_shard_schema(ShardId, DB, CFRefs, _Options) ->
     GenId = 1,
-    Mod = emqx_ds_storage_layer_reference, %% TODO: read from options
+    %% TODO: read from options
+    Mod = emqx_ds_storage_layer_reference,
     ModConfig = #{},
     {GenData, NewCFRefs} = Mod:create(ShardId, DB, GenId, ModConfig),
     GenSchema = #{module => Mod, data => GenData, since => 0, until => undefined},
-    Shard = #{ current_generation => GenId
-             , default_generation_module => Mod
-             , default_generation_confg => ModConfig
-             , {generation, GenId} => GenSchema
-             },
+    Shard = #{
+        current_generation => GenId,
+        default_generation_module => Mod,
+        default_generation_confg => ModConfig,
+        {generation, GenId} => GenSchema
+    },
     {Shard, NewCFRefs ++ CFRefs}.
 
 %% @doc Commit current state of the server to both rocksdb and the persistent term
@@ -286,14 +300,14 @@ commit_metadata(#s{shard_id = ShardId, schema = Schema, shard = Runtime, db = DB
     put_schema_runtime(ShardId, Runtime).
 
 -spec rocksdb_open(shard_id(), emqx_ds:create_db_opts()) ->
-          {ok, rocksdb:db_handle(), cf_refs()} | {error, _TODO}.
+    {ok, rocksdb:db_handle(), cf_refs()} | {error, _TODO}.
 rocksdb_open(Shard, Options) ->
     DefaultDir = binary_to_list(Shard),
     DBDir = unicode:characters_to_list(maps:get(dir, Options, DefaultDir)),
     DBOptions = [
         {create_if_missing, true},
         {create_missing_column_families, true}
-        | Options
+        | maps:get(db_options, Options, [])
     ],
     _ = filelib:ensure_dir(DBDir),
     ExistingCFs =
@@ -334,13 +348,15 @@ generation_get(Shard, GenId) ->
 generations_since(Shard, Since) ->
     Schema = get_schema_runtime(Shard),
     maps:fold(
-      fun({generation, GenId}, #{until := Until}, Acc) when Until =< Since ->
-              [GenId|Acc];
-         (_K, _V, Acc) ->
-              Acc
-      end,
-      [],
-      Schema).
+        fun
+            ({generation, GenId}, #{until := Until}, Acc) when Until =< Since ->
+                [GenId | Acc];
+            (_K, _V, Acc) ->
+                Acc
+        end,
+        [],
+        Schema
+    ).
 
 -define(PERSISTENT_TERM(SHARD), {emqx_ds_storage_layer, SHARD}).
 
