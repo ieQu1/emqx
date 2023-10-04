@@ -79,12 +79,13 @@ list_shards(DB) ->
         list_nodes()
     ).
 
--spec open_db(emqx_ds:db(), emqx_ds:create_db_opts()) -> ok.
+-spec open_db(emqx_ds:db(), emqx_ds:create_db_opts()) -> ok | {error, _}.
 open_db(DB, Opts) ->
+    %% TODO: improve error reporting, don't just crash
     lists:foreach(
         fun(Node) ->
             Shard = shard_id(DB, Node),
-            emqx_ds_proto_v1:open_shard(Node, Shard, Opts)
+            ok = emqx_ds_proto_v1:open_shard(Node, Shard, Opts)
         end,
         list_nodes()
     ).
@@ -104,13 +105,17 @@ get_streams(DB, TopicFilter, StartTime) ->
         fun(Shard) ->
             Node = node_of_shard(Shard),
             Streams = emqx_ds_proto_v1:get_streams(Node, Shard, TopicFilter, StartTime),
-            [
-                {add_shard_to_rank(Shard, Rank), #stream{
-                    shard = Shard,
-                    enc = I
-                }}
-             || {Rank, I} <- Streams
-            ]
+            lists:map(
+                fun({RankY, Stream}) ->
+                    RankX = erlang:phash2(Shard, 255),
+                    Rank = {RankX, RankY},
+                    {Rank, #stream{
+                        shard = Shard,
+                        enc = Stream
+                    }}
+                end,
+                Streams
+            )
         end,
         Shards
     ).
@@ -142,8 +147,8 @@ next(Iter0, BatchSize) ->
         {ok, StorageIter, Batch} ->
             Iter = #iterator{shard = Shard, enc = StorageIter},
             {ok, Iter, Batch};
-        end_of_stream ->
-            end_of_stream
+        Other ->
+            Other
     end.
 
 %%================================================================================

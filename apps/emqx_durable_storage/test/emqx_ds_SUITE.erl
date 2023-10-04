@@ -33,7 +33,7 @@ t_01_smoke_store(_Config) ->
     DB = <<"default">>,
     ?assertMatch(ok, emqx_ds:open_db(DB, #{})),
     Msg = message(<<"foo/bar">>, <<"foo">>, 0),
-    ?assertMatch({ok, _}, emqx_ds:store_batch(DB, [Msg])).
+    ?assertMatch(ok, emqx_ds:store_batch(DB, [Msg])).
 
 %% A simple smoke test that verifies that getting the list of streams
 %% doesn't crash and that iterators can be opened.
@@ -41,8 +41,26 @@ t_02_smoke_get_streams_start_iter(_Config) ->
     DB = <<"default">>,
     ?assertMatch(ok, emqx_ds:open_db(DB, #{})),
     StartTime = 0,
-    [Stream1 | _] = emqx_ds:get_streams(DB, ['#'], StartTime),
-    ?assertMatch({ok, _Iter}, emqx_ds:open_iterator(Stream1, StartTime)).
+    [{Rank, Stream}] = emqx_ds:get_streams(DB, ['#'], StartTime),
+    ?assertMatch({_, _}, Rank),
+    ?assertMatch({ok, _Iter}, emqx_ds:make_iterator(Stream, StartTime)).
+
+%% A simple smoke test that verifies that it's possible to iterate
+%% over messages.
+t_03_smoke_iterate(_Config) ->
+    DB = atom_to_binary(?FUNCTION_NAME),
+    ?assertMatch(ok, emqx_ds:open_db(DB, #{})),
+    StartTime = 0,
+    Msgs = [
+        message(<<"foo/bar">>, <<"1">>, 0),
+        message(<<"foo">>, <<"2">>, 1),
+        message(<<"bar/bar">>, <<"3">>, 2)
+    ],
+    ?assertMatch(ok, emqx_ds:store_batch(DB, Msgs)),
+    [{_, Stream}] = emqx_ds:get_streams(DB, ['#'], StartTime),
+    {ok, Iter0} = emqx_ds:make_iterator(Stream, StartTime),
+    {ok, Iter, Batch} = iterate(Iter0, 1),
+    ?assertEqual(Msgs, Batch, {Iter0, Iter}).
 
 message(Topic, Payload, PublishedAt) ->
     #message{
@@ -51,6 +69,19 @@ message(Topic, Payload, PublishedAt) ->
         timestamp = PublishedAt,
         id = emqx_guid:gen()
     }.
+
+iterate(It, BatchSize) ->
+    iterate(It, BatchSize, []).
+
+iterate(It0, BatchSize, Acc) ->
+    case emqx_ds:next(It0, BatchSize) of
+        {ok, It, []} ->
+            {ok, It, Acc};
+        {ok, It, Msgs} ->
+            iterate(It, BatchSize, Acc ++ Msgs);
+        Ret ->
+            Ret
+    end.
 
 %% CT callbacks
 
@@ -67,9 +98,10 @@ end_per_suite(Config) ->
     ok = emqx_cth_suite:stop(?config(apps, Config)),
     ok.
 
-init_per_testcase(TC, Config) ->
+init_per_testcase(_TC, Config) ->
+    snabbkaffe:fix_ct_logging(),
     application:ensure_all_started(emqx_durable_storage),
     Config.
 
-end_per_testcase(TC, _Config) ->
+end_per_testcase(_TC, _Config) ->
     ok = application:stop(emqx_durable_storage).

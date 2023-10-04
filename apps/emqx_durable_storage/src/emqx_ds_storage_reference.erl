@@ -16,9 +16,9 @@
 
 %% @doc Reference implementation of the storage.
 %%
-%% Extremely slow and inefficient. It also doesn't handle restart of
-%% the Erlang node properly, so obviously it's only to be used for
-%% testing.
+%% Trivial, extremely slow and inefficient. It also doesn't handle
+%% restart of the Erlang node properly, so obviously it's only to be
+%% used for testing.
 -module(emqx_ds_storage_reference).
 
 -behavior(emqx_ds_storage_layer).
@@ -65,7 +65,7 @@
 %% behavior callbacks
 %%================================================================================
 
-create(_Shard, DBHandle, GenId, _Options) ->
+create(_ShardId, DBHandle, GenId, _Options) ->
     CFName = data_cf(GenId),
     {ok, CFHandle} = rocksdb:create_column_family(DBHandle, CFName, []),
     Schema = #schema{},
@@ -78,7 +78,8 @@ open(_Shard, DBHandle, GenId, CFRefs, #schema{}) ->
 store_batch(_ShardId, #s{db = DB, cf = CF}, Messages, _Options) ->
     lists:foreach(
         fun(Msg) ->
-            Key = integer_to_binary(erlang:unique_integer([monotonic])),
+            Id = erlang:unique_integer([monotonic]),
+            Key = <<Id:64>>,
             Val = term_to_binary(Msg),
             rocksdb:put(DB, CF, Key, Val, [])
         end,
@@ -89,15 +90,22 @@ get_streams(_Shard, _Data, TopicFilter, _StartTime) ->
     [#stream{topic_filter = TopicFilter}].
 
 make_iterator(_Shard, _Data, #stream{topic_filter = TopicFilter}, StartTime) ->
-    #it{
+    {ok, #it{
         topic_filter = TopicFilter,
         start_time = StartTime
-    }.
+    }}.
 
 next(_Shard, #s{db = DB, cf = CF}, It0, BatchSize) ->
     #it{topic_filter = TopicFilter, start_time = StartTime, last_seen_message_key = Key0} = It0,
     {ok, ITHandle} = rocksdb:iterator(DB, CF, []),
-    {Key, Messages} = do_next(TopicFilter, StartTime, ITHandle, BatchSize, Key0, Key0, []),
+    Action = case Key0 of
+                 first ->
+                     first;
+                 _ ->
+                     rocksdb:iterator_move(ITHandle, Key0),
+                     next
+             end,
+    {Key, Messages} = do_next(TopicFilter, StartTime, ITHandle, Action, BatchSize, Key0, []),
     rocksdb:iterator_close(ITHandle),
     It = It0#it{last_seen_message_key = Key},
     {ok, It, lists:reverse(Messages)}.
@@ -106,20 +114,18 @@ next(_Shard, #s{db = DB, cf = CF}, It0, BatchSize) ->
 %% Internal functions
 %%================================================================================
 
-do_next(_, _, _, 0, _, Key, Acc) ->
+do_next(_, _, _, _, 0, Key, Acc) ->
     {Key, Acc};
-do_next(TopicFilter, StartTime, IT, NLeft, Action, Key0, Acc) ->
+do_next(TopicFilter, StartTime, IT, Action, NLeft, Key0, Acc) ->
     case rocksdb:iterator_move(IT, Action) of
         {ok, Key, Blob} ->
             Msg = #message{topic = Topic, timestamp = TS} = binary_to_term(Blob),
             case emqx_topic:match(Topic, TopicFilter) andalso TS >= StartTime of
                 true ->
-                    do_next(TopicFilter, StartTime, IT, NLeft - 1, next, Key, [Msg | Acc]);
+                    do_next(TopicFilter, StartTime, IT, next, NLeft - 1, Key, [Msg | Acc]);
                 false ->
-                    do_next(TopicFilter, StartTime, IT, NLeft, next, Key, Acc)
+                    do_next(TopicFilter, StartTime, IT, next, NLeft, Key, Acc)
             end;
-        %% {ok, Key} -> Shouldn't happen?
-        %%     {Key, Acc};
         {error, invalid_iterator} ->
             {Key0, Acc}
     end.

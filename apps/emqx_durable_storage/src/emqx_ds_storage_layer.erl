@@ -111,7 +111,7 @@
     [_Stream].
 
 -callback make_iterator(shard_id(), _Data, _Stream, emqx_ds:time()) ->
-    _Iterator.
+    emqx_ds:make_iterator_result(_Iterator).
 
 -callback next(shard_id(), _Data, Iter, pos_integer()) ->
     {ok, Iter, [emqx_types:message()]} | {error, _}.
@@ -137,7 +137,8 @@ store_batch(Shard, Messages, Options) ->
 get_streams(Shard, TopicFilter, StartTime) ->
     Gens = generations_since(Shard, StartTime),
     lists:flatmap(
-        fun({GenId, #{module := Mod, data := GenData}}) ->
+        fun(GenId) ->
+            #{module := Mod, data := GenData} = generation_get(Shard, GenId),
             Streams = Mod:get_streams(Shard, GenData, TopicFilter, StartTime),
             [
                 {GenId, #stream{
@@ -208,19 +209,19 @@ start_link(Shard, Options) ->
 init({ShardId, Options}) ->
     process_flag(trap_exit, true),
     erase_schema_runtime(ShardId),
-    {ok, DB, CFRefs} = rocksdb_open(ShardId, Options),
-    {Schema, NewCFRefs} =
+    {ok, DB, CFRefs0} = rocksdb_open(ShardId, Options),
+    {Schema, CFRefs} =
         case get_schema_persistent(DB) of
             not_found ->
-                create_new_shard_schema(ShardId, DB, CFRefs, Options);
+                create_new_shard_schema(ShardId, DB, CFRefs0, Options);
             Scm ->
-                {Scm, CFRefs}
+                {Scm, CFRefs0}
         end,
     Shard = open_shard(ShardId, DB, CFRefs, Schema),
     S = #s{
         shard_id = ShardId,
         db = DB,
-        cf_refs = NewCFRefs,
+        cf_refs = CFRefs,
         schema = Schema,
         shard = Shard
     },
@@ -280,18 +281,18 @@ open_generation(ShardId, DB, CFRefs, GenId, GenSchema) ->
     {shard_schema(), cf_refs()}.
 create_new_shard_schema(ShardId, DB, CFRefs, _Options) ->
     GenId = 1,
-    %% TODO: read from options
-    Mod = emqx_ds_storage_layer_reference,
+    %% TODO: read from options/config
+    Mod = emqx_ds_storage_reference,
     ModConfig = #{},
     {GenData, NewCFRefs} = Mod:create(ShardId, DB, GenId, ModConfig),
     GenSchema = #{module => Mod, data => GenData, since => 0, until => undefined},
-    Shard = #{
+    ShardSchema = #{
         current_generation => GenId,
         default_generation_module => Mod,
         default_generation_confg => ModConfig,
         {generation, GenId} => GenSchema
     },
-    {Shard, NewCFRefs ++ CFRefs}.
+    {ShardSchema, NewCFRefs ++ CFRefs}.
 
 %% @doc Commit current state of the server to both rocksdb and the persistent term
 -spec commit_metadata(server_state()) -> ok.
@@ -349,7 +350,7 @@ generations_since(Shard, Since) ->
     Schema = get_schema_runtime(Shard),
     maps:fold(
         fun
-            ({generation, GenId}, #{until := Until}, Acc) when Until =< Since ->
+            ({generation, GenId}, #{until := Until}, Acc) when Until >= Since ->
                 [GenId | Acc];
             (_K, _V, Acc) ->
                 Acc
@@ -371,7 +372,8 @@ put_schema_runtime(Shard, RuntimeSchema) ->
 
 -spec erase_schema_runtime(shard_id()) -> ok.
 erase_schema_runtime(Shard) ->
-    persistent_term:erase(?PERSISTENT_TERM(Shard)).
+    persistent_term:erase(?PERSISTENT_TERM(Shard)),
+    ok.
 
 -undef(PERSISTENT_TERM).
 
