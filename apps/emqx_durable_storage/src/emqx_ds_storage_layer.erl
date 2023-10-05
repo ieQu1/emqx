@@ -26,6 +26,8 @@
 %% internal exports:
 -export_type([gen_id/0, generation/0, cf_refs/0, stream/0, iterator/0]).
 
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
 %%================================================================================
 %% Type declarations
 %%================================================================================
@@ -216,6 +218,7 @@ start_link(Shard, Options) ->
 
 init({ShardId, Options}) ->
     process_flag(trap_exit, true),
+    logger:set_process_metadata(#{shard_id => ShardId, domain => [ds, storage_layer, shard]}),
     erase_schema_runtime(ShardId),
     {ok, DB, CFRefs0} = rocksdb_open(ShardId, Options),
     {Schema, CFRefs} =
@@ -292,13 +295,15 @@ add_generation(S0, Since) ->
 -spec open_generation(shard_id(), rocksdb:db_handle(), cf_refs(), gen_id(), generation_schema()) ->
     generation().
 open_generation(ShardId, DB, CFRefs, GenId, GenSchema) ->
+    ?tp(debug, ds_open_generation, #{gen_id => GenId, schema => GenSchema}),
     #{module := Mod, data := Schema} = GenSchema,
     RuntimeData = Mod:open(ShardId, DB, GenId, CFRefs, Schema),
     GenSchema#{data => RuntimeData}.
 
 -spec create_new_shard_schema(shard_id(), rocksdb:db_handle(), cf_refs(), _Options) ->
     {shard_schema(), cf_refs()}.
-create_new_shard_schema(ShardId, DB, CFRefs, _Options) ->
+create_new_shard_schema(ShardId, DB, CFRefs, Options) ->
+    ?tp(notice, ds_create_new_shard_schema, #{shard => ShardId, options => Options}),
     %% TODO: read prototype from options/config
     Schema0 = #{
         current_generation => 0,
@@ -414,7 +419,7 @@ get_schema_persistent(DB) ->
         {ok, Blob} ->
             Schema = binary_to_term(Blob),
             %% Sanity check:
-            #{current_generation := _, default_generation_module := _} = Schema,
+            #{current_generation := _, prototype := _} = Schema,
             Schema;
         not_found ->
             not_found
