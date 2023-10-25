@@ -22,6 +22,8 @@
 
 -include("emqx_mqtt.hrl").
 
+-include("emqx_persistent_session_ds.hrl").
+
 %% Session API
 -export([
     create/3,
@@ -82,20 +84,11 @@
     expires_at := timestamp() | never,
     %% Client’s Subscriptions.
     iterators := #{topic() => subscription()},
-    awaiting_rel := map(),
+    %% Inflight messages
+    inflight := emqx_persistent_message_ds_replayer:inflight(),
     %%
     props := map()
 }.
-
--record(session, {
-    %% same as clientid
-    id :: id(),
-    %% creation time
-    created_at :: _Millisecond :: non_neg_integer(),
-    expires_at = never :: _Millisecond :: non_neg_integer() | never,
-    %% for future usage
-    props = #{} :: map()
-}).
 
 %% -type session() :: #session{}.
 
@@ -285,9 +278,14 @@ publish(_PacketId, Msg, Session) ->
 -spec puback(clientinfo(), emqx_types:packet_id(), session()) ->
     {ok, emqx_types:message(), replies(), session()}
     | {error, emqx_types:reason_code()}.
-puback(_ClientInfo, _PacketId, _Session = #{}) ->
-    % TODO: stub
-    {error, ?RC_PACKET_IDENTIFIER_NOT_FOUND}.
+puback(_ClientInfo, PacketId, Session = #{id := Id, inflight := Inflight0}) ->
+    case emqx_persistent_message_ds_replayer:commit_offset(Id, PacketId, Inflight0) of
+        {true, Inflight} ->
+            Msg = #message{}, %% TODO
+            {ok, Msg, [], Session#{inflight => Inflight}};
+        {false, _} ->
+            {error, ?RC_PACKET_IDENTIFIER_NOT_FOUND}
+    end.
 
 %%--------------------------------------------------------------------
 %% Client -> Broker: PUBREC
@@ -331,17 +329,12 @@ deliver(_ClientInfo, _Delivers, Session) ->
 
 -spec handle_timeout(clientinfo(), emqx_session:common_timer_name(), session()) ->
     {ok, replies(), session()} | {ok, replies(), timeout(), session()}.
-handle_timeout(_ClientInfo, pull, Session = #{id := Id}) ->
-    %% TODO: totally wrong and braindead.
-    Msgs = read_batch(Id, 100),
-    Publishes = lists:map(
-        fun(Msg) ->
-            {packet_id(), Msg}
-        end,
-        Msgs
-    ),
+handle_timeout(_ClientInfo, pull, Session = #{id := Id, inflight := Inflight0}) ->
+    WindowSize = 100,
+    {Publishes, Inflight} = emqx_persistent_message_ds_replayer:poll(Id, Inflight0, WindowSize),
+    %%logger:warning("Inflight: ~p", [Inflight]),
     ensure_timer(pull),
-    {ok, Publishes, Session};
+    {ok, Publishes, Session#{inflight => Inflight}};
 handle_timeout(_ClientInfo, get_streams, Session = #{id := Id}) ->
     renew_streams(Id),
     ensure_timer(get_streams),
@@ -423,34 +416,6 @@ del_subscription(TopicFilterBin, DSSessionId) ->
 %%--------------------------------------------------------------------
 %% Session tables operations
 %%--------------------------------------------------------------------
-
--define(SESSION_TAB, emqx_ds_session).
--define(SESSION_SUBSCRIPTIONS_TAB, emqx_ds_session_subscriptions).
--define(SESSION_STREAM_TAB, emqx_ds_stream_tab).
--define(SESSION_ITER_TAB, emqx_ds_iter_tab).
--define(DS_MRIA_SHARD, emqx_ds_session_shard).
-
--record(ds_sub, {
-    id :: subscription_id(),
-    start_time :: emqx_ds:time(),
-    props = #{} :: map(),
-    extra = #{} :: map()
-}).
--type ds_sub() :: #ds_sub{}.
-
--record(ds_stream, {
-    session :: id(),
-    topic_filter :: emqx_ds:topic_filter(),
-    stream :: emqx_ds:stream(),
-    rank :: emqx_ds:stream_rank()
-}).
-%-type ds_stream() :: #ds_stream{}.
-
--record(ds_iter, {
-    id :: {id(), emqx_ds:stream()},
-    iter :: emqx_ds:iterator()
-}).
-%-type ds_iter() :: #ds_iter{}.
 
 create_tables() ->
     ok = emqx_ds:open_db(?PERSISTENT_MESSAGE_DB, #{
@@ -548,7 +513,8 @@ session_create(SessionId, Props) ->
         id = SessionId,
         created_at = erlang:system_time(millisecond),
         expires_at = never,
-        props = Props
+        props = Props,
+        inflight = emqx_persistent_message_ds_replayer:new()
     },
     ok = mnesia:write(?SESSION_TAB, Session, write),
     Session.
@@ -676,26 +642,6 @@ renew_streams(Id, ExistingStreams, TopicFilter, StartTime) ->
         end
     ).
 
-%% Pull a batch of messages from DS to fill the local buffer:
--spec read_batch(id(), non_neg_integer()) -> [emqx_types:message()].
-read_batch(Id, BatchSize) ->
-    Streams0 = [S || #ds_stream{stream = S} <- mnesia:dirty_read(?SESSION_STREAM_TAB, Id)],
-    Streams = shuffle(Streams0),
-    do_read_batch(Id, BatchSize, Streams).
-
-do_read_batch(_SessionId, 0, _Streams) ->
-    [];
-do_read_batch(_SessionId, _BatchSize, []) ->
-    [];
-do_read_batch(SessionId, BatchSize, [Stream | Streams]) ->
-    case mnesia:dirty_read(?SESSION_ITER_TAB, {SessionId, Stream}) of
-        [#ds_iter{iter = Iter0}] ->
-            {ok, _Iter, Msgs} = emqx_ds:next(Iter0, BatchSize),
-            Msgs ++ do_read_batch(SessionId, BatchSize - length(Msgs), Streams);
-        [] ->
-            do_read_batch(SessionId, BatchSize, Streams)
-    end.
-
 %%--------------------------------------------------------------------------------
 
 transaction(Fun) ->
@@ -718,7 +664,7 @@ export_subscriptions(DSSubs) ->
     ).
 
 export_session(#session{} = Record) ->
-    export_record(Record, #session.id, [id, created_at, expires_at, props], #{}).
+    export_record(Record, #session.id, [id, created_at, expires_at, inflight, props], #{}).
 
 export_subscription(#ds_sub{} = Record) ->
     export_record(Record, #ds_sub.start_time, [start_time, props, extra], #{}).
@@ -732,27 +678,3 @@ export_record(_, _, [], Acc) ->
 ensure_timer(Type) ->
     emqx_utils:start_timer(100, {emqx_session, Type}),
     ok.
-
--spec shuffle([A]) -> [A].
-shuffle(L0) ->
-    L1 = lists:map(
-        fun(A) ->
-            {rand:uniform(), A}
-        end,
-        L0
-    ),
-    L2 = lists:sort(L1),
-    {_, L} = lists:unzip(L2),
-    L.
-
-packet_id() ->
-    Key = emqx_persistent_session_ds_packet_id,
-    Val =
-        case get(Key) of
-            undefined ->
-                rand:uniform(?MAX_PACKET_ID);
-            N ->
-                N
-        end,
-    put(Key, (Val + 1) rem ?MAX_PACKET_ID),
-    Val.
