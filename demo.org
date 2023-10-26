@@ -1,0 +1,59 @@
+* Start EMQX
+#+begin_src bash
+export EMQX_persistent_session_store__ds='true'
+bin/emqx console
+#+end_src
+
+* Subscribe
+
+#+begin_src bash
+mosquitto_sub -t foo/# -c -i sub -q 1
+
+mosquitto_sub -t bar/+/foo -c -i sub -q 1
+#+end_src
+
+* Publish
+
+#+begin_src bash
+mosquitto_pub -t foo/1/2 -q 1 -m "foo/1/2"
+mosquitto_pub -t foo/1/5 -q 1 -m "foo/1/5"
+#+end_src
+
+#+RESULTS:
+
+#+begin_src bash
+mosquitto_pub -t bar/1/foo -q 1 -m "bar/1/foo"
+mosquitto_pub -t bar/bar1/foo -q 1 -m "bar/bar1/foo"
+
+mosquitto_pub -t bar/1/quux -q 1 -m "nomatch"
+mosquitto_pub -t bar/1 -q 1 -m "nomatch"
+mosquitto_pub -t bar/1/bar/baz -q 1 -m "nomatch"
+#+end_src
+
+#+RESULTS:
+
+Loop:
+#+begin_src bash
+for i in $(seq 1 100); do mosquitto_pub -t bar/$i/foo -q 1 -m "$i!"; done
+#+end_src
+
+#+RESULTS:
+
+#+RESULTS:
+
+* Disconnect subscriber
+
+* Restart EMQX
+* Reconnect subscriber
+
+* Run loadgen
+
+#+begin_src bash
+~/Documents/work/emqttb/emqttb --loiter 5s @pub -q1 -t foo/bar/%n -N100 --pubinterval 1s > /dev/null
+#+end_src
+
+* Check the number of streams:
+
+#+begin_src erlang
+length(mnesia:dirty_read(emqx_ds_stream_tab, <<"sub">>)).
+#+end_src
