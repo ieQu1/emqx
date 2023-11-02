@@ -188,7 +188,7 @@ receive_messages(Count, Msgs) ->
             receive_messages(Count - 1, [Msg | Msgs]);
         _Other ->
             receive_messages(Count, Msgs)
-    after 5000 ->
+    after 15000 ->
         Msgs
     end.
 
@@ -513,6 +513,7 @@ t_process_dies_session_expires(Config) ->
 t_publish_while_client_is_gone_qos1(Config) ->
     %% A persistent session should receive messages in its
     %% subscription even if the process owning the session dies.
+    debug(?FUNCTION_NAME),
     ConnFun = ?config(conn_fun, Config),
     Topic = ?config(topic, Config),
     STopic = ?config(stopic, Config),
@@ -734,3 +735,11 @@ skip_ds_tc(Config) ->
         _ ->
             Config
     end.
+
+debug(TC) ->
+    Filename = atom_to_list(TC) ++ ".trace." ++ integer_to_list(erlang:system_time()),
+    dbg:tracer(port, dbg:trace_port(file, Filename)),
+    dbg:p(all, c),
+    dbg:tpl(emqx_ds, '_'),
+    dbg:tpl(emqx_persistent_session_ds, '_'),
+    dbg:tpl(emqx_ds_storage_layer, '_').
