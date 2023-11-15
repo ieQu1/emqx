@@ -19,7 +19,7 @@
 -include("emqx.hrl").
 
 -export([init/0]).
--export([is_store_enabled/0]).
+-export([is_store_enabled/0, force_ds/0]).
 
 %% Message persistence
 -export([
@@ -52,6 +52,12 @@ init() ->
 -spec is_store_enabled() -> boolean().
 is_store_enabled() ->
     emqx_config:get([persistent_session_store, ds]).
+
+%% Undocumented dev-only option that forces all messages to go through
+%% `emqx_persistent_session_ds':
+-spec force_ds() -> boolean().
+force_ds() ->
+    emqx_config:get([persistent_session_store, force_ds]).
 
 %%--------------------------------------------------------------------
 

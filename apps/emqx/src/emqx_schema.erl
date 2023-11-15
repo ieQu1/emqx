@@ -328,6 +328,15 @@ fields("persistent_session_store") ->
                     importance => ?IMPORTANCE_HIDDEN
                 }
             )},
+        {"force_ds",
+            sc(
+                boolean(),
+                #{
+                    default => false,
+                    %% Only for testing, shall remain hidden
+                    importance => ?IMPORTANCE_HIDDEN
+                }
+            )},
         {"on_disc",
             sc(
                 boolean(),
