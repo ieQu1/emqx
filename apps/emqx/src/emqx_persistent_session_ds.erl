@@ -98,7 +98,7 @@
     %% When the session should expire
     expires_at := timestamp() | never,
     %% Client’s Subscriptions.
-    iterators := #{topic() => subscription()},
+    subscriptions := #{topic() => subscription()},
     %% Inflight messages
     inflight := emqx_persistent_message_ds_replayer:inflight(),
     %% Receive maximum
@@ -155,12 +155,12 @@ open(#{clientid := ClientID} = _ClientInfo, ConnInfo) ->
 ensure_session(ClientID, ConnInfo, Conf) ->
     {ok, Session, #{}} = session_ensure_new(ClientID, Conf),
     ReceiveMaximum = receive_maximum(ConnInfo),
-    Session#{iterators => #{}, receive_maximum => ReceiveMaximum}.
+    Session#{subscriptions => #{}, receive_maximum => ReceiveMaximum}.
 
 open_session(ClientID) ->
     case session_open(ClientID) of
         {ok, Session, Subscriptions} ->
-            Session#{iterators => prep_subscriptions(Subscriptions)};
+            Session#{subscriptions => prep_subscriptions(Subscriptions)};
         false ->
             false
     end.
@@ -195,10 +195,10 @@ info(created_at, #{created_at := CreatedAt}) ->
     CreatedAt;
 info(is_persistent, #{}) ->
     true;
-info(subscriptions, #{iterators := Iters}) ->
-    maps:map(fun(_, #{props := SubOpts}) -> SubOpts end, Iters);
-info(subscriptions_cnt, #{iterators := Iters}) ->
-    maps:size(Iters);
+info(subscriptions, #{subscriptions := Subs}) ->
+    maps:map(fun(_, #{props := SubOpts}) -> SubOpts end, Subs);
+info(subscriptions_cnt, #{subscriptions := Subs}) ->
+    maps:size(Subs);
 info(subscriptions_max, #{props := Conf}) ->
     maps:get(max_subscriptions, Conf);
 info(upgrade_qos, #{props := Conf}) ->
@@ -244,30 +244,30 @@ stats(Session) ->
 subscribe(
     TopicFilter,
     SubOpts,
-    Session = #{id := ID, iterators := Iters}
-) when is_map_key(TopicFilter, Iters) ->
-    Iterator = maps:get(TopicFilter, Iters),
-    NIterator = update_subscription(TopicFilter, Iterator, SubOpts, ID),
-    {ok, Session#{iterators := Iters#{TopicFilter => NIterator}}};
+    Session = #{id := ID, subscriptions := Subs}
+) when is_map_key(TopicFilter, Subs) ->
+    Subscription = maps:get(TopicFilter, Subs),
+    NSubscription = update_subscription(TopicFilter, Subscription, SubOpts, ID),
+    {ok, Session#{subscriptions := Subs#{TopicFilter => NSubscription}}};
 subscribe(
     TopicFilter,
     SubOpts,
-    Session = #{id := ID, iterators := Iters}
+    Session = #{id := ID, subscriptions := Subs}
 ) ->
     % TODO: max_subscriptions
-    Iterator = add_subscription(TopicFilter, SubOpts, ID),
-    {ok, Session#{iterators := Iters#{TopicFilter => Iterator}}}.
+    Subscription = add_subscription(TopicFilter, SubOpts, ID),
+    {ok, Session#{subscriptions := Subs#{TopicFilter => Subscription}}}.
 
 -spec unsubscribe(topic(), session()) ->
     {ok, session(), emqx_types:subopts()} | {error, emqx_types:reason_code()}.
 unsubscribe(
     TopicFilter,
-    Session = #{id := ID, iterators := Iters}
-) when is_map_key(TopicFilter, Iters) ->
-    Iterator = maps:get(TopicFilter, Iters),
-    SubOpts = maps:get(props, Iterator),
+    Session = #{id := ID, subscriptions := Subs}
+) when is_map_key(TopicFilter, Subs) ->
+    Subscription = maps:get(TopicFilter, Subs),
+    SubOpts = maps:get(props, Subscription),
     ok = del_subscription(TopicFilter, ID),
-    {ok, Session#{iterators := maps:remove(TopicFilter, Iters)}, SubOpts};
+    {ok, Session#{subscriptions := maps:remove(TopicFilter, Subs)}, SubOpts};
 unsubscribe(
     _TopicFilter,
     _Session = #{}
@@ -276,10 +276,10 @@ unsubscribe(
 
 -spec get_subscription(topic(), session()) ->
     emqx_types:subopts() | undefined.
-get_subscription(TopicFilter, #{iterators := Iters}) ->
-    case maps:get(TopicFilter, Iters, undefined) of
-        Iterator = #{} ->
-            maps:get(props, Iterator);
+get_subscription(TopicFilter, #{subscriptions := Subs}) ->
+    case maps:get(TopicFilter, Subs, undefined) of
+        Subscription = #{} ->
+            maps:get(props, Subscription);
         undefined ->
             undefined
     end.
