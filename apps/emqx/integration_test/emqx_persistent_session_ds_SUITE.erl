@@ -158,6 +158,31 @@ is_persistent_connect_opts(#{properties := #{'Session-Expiry-Interval' := EI}}) 
 %% Testcases
 %%------------------------------------------------------------------------------
 
+t_qos0(_Config) ->
+    ClientId = atom_to_binary(?FUNCTION_NAME),
+    SubTopicFilter = <<"t/#">>,
+    Subscriber = start_client(#{
+        clientid => ClientId,
+        properties => #{'Session-Expiry-Interval' => 30}
+    }),
+    {ok, _} = emqtt:connect(Subscriber),
+    Publisher = start_client(#{
+        clientid => "publisher", properties => #{'Session-Expiry-Interval' => 0}
+    }),
+    {ok, _} = emqtt:connect(Publisher),
+    %% 1. Subscribe as QoS1:
+    {ok, _, [?RC_GRANTED_QOS_1]} = emqtt:subscribe(Subscriber, SubTopicFilter, qos1),
+    %% 2. Publish QoS0 messages (they should be delivered as QoS0):
+    ok = emqtt:publish(Publisher, <<"t/1">>, <<"hello1">>, 0),
+    ok = emqtt:publish(Publisher, <<"t/2">>, <<"hello2">>, 0),
+    ?assertMatch(
+        [
+            #{qos := 0, topic := <<"t/1">>, payload := <<"hello1">>},
+            #{qos := 0, topic := <<"t/2">>, payload := <<"hello2">>}
+        ],
+        receive_messages(2)
+    ).
+
 t_non_persistent_session_subscription(_Config) ->
     ClientId = atom_to_binary(?FUNCTION_NAME),
     SubTopicFilter = <<"t/#">>,
@@ -406,3 +431,18 @@ do_t_session_discard(Params) ->
         end
     ),
     ok.
+
+receive_messages(Count) ->
+    receive_messages(Count, []).
+
+receive_messages(0, Msgs) ->
+    Msgs;
+receive_messages(Count, Msgs) ->
+    receive
+        {publish, Msg} ->
+            receive_messages(Count - 1, [Msg | Msgs]);
+        _Other ->
+            receive_messages(Count, Msgs)
+    after 15000 ->
+        Msgs
+    end.
