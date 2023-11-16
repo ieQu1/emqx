@@ -87,7 +87,7 @@
 -type subscription_id() :: {id(), topic_filter()}.
 -type subscription() :: #{
     start_time := emqx_ds:time(),
-    propts := map(),
+    props := map(),
     extra := map()
 }.
 -type session() :: #{
@@ -98,7 +98,7 @@
     %% When the session should expire
     expires_at := timestamp() | never,
     %% Client’s Subscriptions.
-    subscriptions := #{topic() => subscription()},
+    subscriptions := #{topic_filter() => subscription()},
     %% Inflight messages
     inflight := emqx_persistent_message_ds_replayer:inflight(),
     %% Receive maximum
