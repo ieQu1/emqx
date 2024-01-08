@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_ds_sup).
 
@@ -33,8 +33,14 @@ start_link() ->
 init([]) ->
     %% TODO: technically, we don't need rocksDB for the alternative
     %% backends. But right now we have any:
+    %%
+    %% TODO: emqx_durable storage should not depend on the emqx_conf
+    %% or emqx. Fix it later:
     Children =
-        case mria:rocksdb_backend_available() of
+        case
+            mria:rocksdb_backend_available() andalso
+                emqx_persistent_message:is_persistence_enabled()
+        of
             true -> [meta(), storage_layer_sup()];
             false -> []
         end,
