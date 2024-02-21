@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2023 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -497,6 +497,15 @@ fill_defaults(RawConf, Opts) ->
     ).
 
 -spec fill_defaults(module(), raw_config(), hocon_tconf:opts()) -> map().
+fill_defaults(_SchemaMod, RawConf = #{<<"durable_storage">> := _}, _) ->
+    %% FIXME: kludge to prevent `emqx_config' module from filling in
+    %% the default values for backends and layouts. These records are
+    %% inside unions, and adding default values there will add
+    %% incompatible fields.
+    %%
+    %% Note: this function is called for each individual conf root, so
+    %% this clause only affects this particular subtree.
+    RawConf;
 fill_defaults(SchemaMod, RawConf, Opts0) ->
     Opts = maps:merge(#{required => false, make_serializable => true}, Opts0),
     hocon_tconf:check_plain(
