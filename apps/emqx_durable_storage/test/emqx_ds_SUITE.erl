@@ -28,12 +28,9 @@
 
 opts() ->
     #{
-        backend => builtin,
+        backend => builtin_local,
         storage => {emqx_ds_storage_reference, #{}},
-        n_shards => ?N_SHARDS,
-        n_sites => 1,
-        replication_factor => 3,
-        replication_options => #{}
+        n_shards => ?N_SHARDS
     }.
 
 %% A simple smoke test that verifies that opening/closing the DB
@@ -41,24 +38,24 @@ opts() ->
 t_00_smoke_open_drop(_Config) ->
     DB = 'DB',
     ?assertMatch(ok, emqx_ds:open_db(DB, opts())),
-    %% Check metadata:
-    %%    We have only one site:
-    [Site] = emqx_ds_replication_layer_meta:sites(),
-    %%    Check all shards:
-    Shards = emqx_ds_replication_layer_meta:shards(DB),
-    %%    Since there is only one site all shards should be allocated
-    %%    to this site:
-    MyShards = emqx_ds_replication_layer_meta:my_shards(DB),
-    ?assertEqual(?N_SHARDS, length(Shards)),
-    lists:foreach(
-        fun(Shard) ->
-            ?assertEqual(
-                [Site], emqx_ds_replication_layer_meta:replica_set(DB, Shard)
-            )
-        end,
-        Shards
-    ),
-    ?assertEqual(lists:sort(Shards), lists:sort(MyShards)),
+    %% %% Check metadata:
+    %% %%    We have only one site:
+    %% [Site] = emqx_ds_replication_layer_meta:sites(),
+    %% %%    Check all shards:
+    %% Shards = emqx_ds_replication_layer_meta:shards(DB),
+    %% %%    Since there is only one site all shards should be allocated
+    %% %%    to this site:
+    %% MyShards = emqx_ds_replication_layer_meta:my_shards(DB),
+    %% ?assertEqual(?N_SHARDS, length(Shards)),
+    %% lists:foreach(
+    %%     fun(Shard) ->
+    %%         ?assertEqual(
+    %%             [Site], emqx_ds_replication_layer_meta:replica_set(DB, Shard)
+    %%         )
+    %%     end,
+    %%     Shards
+    %% ),
+    %% ?assertEqual(lists:sort(Shards), lists:sort(MyShards)),
     %% Reopen the DB and make sure the operation is idempotent:
     ?assertMatch(ok, emqx_ds:open_db(DB, opts())),
     %% Close the DB:
@@ -101,7 +98,7 @@ t_03_smoke_iterate(_Config) ->
         message(<<"foo">>, <<"2">>, 1),
         message(<<"bar/bar">>, <<"3">>, 2)
     ],
-    ?assertMatch(ok, emqx_ds:store_batch(DB, Msgs)),
+    ?assertMatch(ok, emqx_ds:store_batch(DB, Msgs, #{sync => true})),
     [{_, Stream}] = emqx_ds:get_streams(DB, TopicFilter, StartTime),
     {ok, Iter0} = emqx_ds:make_iterator(DB, Stream, TopicFilter, StartTime),
     {ok, Iter, Batch} = emqx_ds_test_helpers:consume_iter(DB, Iter0),
@@ -122,7 +119,7 @@ t_04_restart(_Config) ->
         message(<<"foo">>, <<"2">>, 1),
         message(<<"bar/bar">>, <<"3">>, 2)
     ],
-    ?assertMatch(ok, emqx_ds:store_batch(DB, Msgs)),
+    ?assertMatch(ok, emqx_ds:store_batch(DB, Msgs, #{sync => true})),
     [{_, Stream}] = emqx_ds:get_streams(DB, TopicFilter, StartTime),
     {ok, Iter0} = emqx_ds:make_iterator(DB, Stream, TopicFilter, StartTime),
     %% Restart the application:
@@ -163,7 +160,7 @@ t_06_update_config(_Config) ->
     ?assertMatch(ok, emqx_ds:open_db(DB, opts())),
     TopicFilter = ['#'],
 
-    DataSet = update_data_set(),
+    DataSet = update_adta_set(),
 
     ToMsgs = fun(Datas) ->
         lists:map(
@@ -710,11 +707,8 @@ t_store_batch_fail(_Config) ->
             ?assertMatch(
                 {error, unrecoverable, mock}, emqx_ds:store_batch(DB, Batch2, #{sync => true})
             ),
-            meck:unload(emqx_ds_storage_layer),
             %% Inject a recoveralbe error:
-            meck:new(ra, [passthrough, no_history]),
-            meck:expect(ra, process_command, fun(Servers, Shard, Command) ->
-                ?tp(ra_command, #{servers => Servers, shard => Shard, command => Command}),
+            meck:expect(emqx_ds_storage_layer, store_batch, fun(_DB, _Shard, _Messages) ->
                 {timeout, mock}
             end),
             Batch3 = [
@@ -729,7 +723,7 @@ t_store_batch_fail(_Config) ->
                 {error, recoverable, {timeout, mock}},
                 emqx_ds:store_batch(DB, Batch3, #{sync => true})
             ),
-            meck:unload(ra),
+            meck:unload(emqx_ds_storage_layer),
             ?assertMatch(ok, emqx_ds:store_batch(DB, Batch3, #{sync => true})),
             lists:sort(emqx_ds_test_helpers:consume_per_stream(DB, ['#'], 1))
         after

@@ -15,14 +15,15 @@
 %%--------------------------------------------------------------------
 
 %% @doc This supervisor manages the global worker processes needed for
-%% the functioning of builtin local databases, and all builtin local
-%% databases that attach to it.
--module(emqx_ds_builtin_local_sup).
+%% the functioning of builtin databases, and all builtin database
+%% attach to it.
+-module(emqx_ds_builtin_sup).
 
 -behaviour(supervisor).
 
 %% API:
 -export([start_db/2, stop_db/1]).
+-export([set_gvar/3, get_gvar/3, clean_gvars/1]).
 
 %% behavior callbacks:
 -export([init/1]).
@@ -37,7 +38,14 @@
 %%================================================================================
 
 -define(top, ?MODULE).
--define(databases, emqx_ds_builtin_local_databases_sup).
+-define(databases, emqx_ds_builtin_databases_sup).
+
+-define(gvar_tab, emqx_ds_builtin_gvar).
+
+-record(gvar, {
+    k :: {emqx_ds:db(), _Key},
+    v :: _Value
+}).
 
 %%================================================================================
 %% API functions
@@ -49,7 +57,7 @@ start_db(DB, Opts) ->
     ensure_top(),
     ChildSpec = #{
         id => DB,
-        start => {emqx_ds_builtin_local_db_sup, start_db, [DB, Opts]},
+        start => {emqx_ds_builtin_db_sup, start_db, [DB, Opts]},
         type => supervisor,
         shutdown => infinity
     },
@@ -61,10 +69,30 @@ stop_db(DB) ->
         Pid when is_pid(Pid) ->
             _ = supervisor:terminate_child(?databases, DB),
             _ = supervisor:delete_child(?databases, DB),
-            ok;
+            clean_gvars(DB);
         undefined ->
             ok
     end.
+
+%% @doc Set a DB-global variable. Please don't abuse this API.
+-spec set_gvar(emqx_ds:db(), _Key, _Val) -> ok.
+set_gvar(DB, Key, Val) ->
+    ets:insert(?gvar_tab, #gvar{k = {DB, Key}, v = Val}),
+    ok.
+
+-spec get_gvar(emqx_ds:db(), _Key, Val) -> Val.
+get_gvar(DB, Key, Default) ->
+    case ets:lookup(?gvar_tab, {DB, Key}) of
+        [#gvar{v = Val}] ->
+            Val;
+        [] ->
+            Default
+    end.
+
+-spec clean_gvars(emqx_ds:db()) -> ok.
+clean_gvars(DB) ->
+    ets:match_delete(?gvar_tab, #gvar{k = {DB, '_'}, _ = '_'}),
+    ok.
 
 %%================================================================================
 %% behavior callbacks
@@ -84,7 +112,7 @@ init(?top) ->
     MetricsWorker = emqx_ds_builtin_metrics:child_spec(),
     MetadataServer = #{
         id => metadata_server,
-        start => {emqx_ds_builtin_local_meta, start_link, []},
+        start => {emqx_ds_replication_layer_meta, start_link, []},
         restart => permanent,
         type => worker,
         shutdown => 5000
@@ -96,6 +124,7 @@ init(?top) ->
         type => supervisor,
         shutdown => infinity
     },
+    _ = ets:new(?gvar_tab, [named_table, set, public, {keypos, #gvar.k}, {read_concurrency, true}]),
     %%
     SupFlags = #{
         strategy => one_for_all,

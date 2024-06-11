@@ -1,0 +1,29 @@
+digraph cats {
+  node [shape="rectangle"];
+  edge [style="invis"];
+
+  subgraph cluster_EMQX1 {
+    label="EMQX1";
+    rankdir="TB";
+
+    subgraph cluster {
+       label="DS:messages"
+       rankdir="LR";
+       subgraph cluster_c1 {
+         label="shard:1"
+         rank=same;
+         g1 [label="gen1"];
+         g2 [label="gen2"];
+         g3 [label="gen3"];
+         g1 -> g2 -> g3;
+       }
+       subgraph cluster_c2 {
+         label="shard:2"
+         g4;
+         g5;
+         g6;
+       }
+    }
+    {rank:same; g1 -> g4}
+  }
+}

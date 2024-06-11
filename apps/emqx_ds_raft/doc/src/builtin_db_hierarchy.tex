@@ -1,0 +1,37 @@
+\documentclass{minimal}
+
+\usepackage{tikz}
+\usetikzlibrary{matrix,positioning,fit,shapes.geometric,shapes.arrows,arrows.meta,quotes}
+
+\pgfdeclarelayer{back}
+\pgfdeclarelayer{back2}
+\pgfsetlayers{back,back2,main}
+
+
+\begin{document}
+
+\begin{tikzpicture}
+  [
+    emqx/.style={rounded corners,draw},
+    client/.style={rounded corners,draw},
+    emqx/.style={rounded corners,draw,minimum width=2cm},
+    mnesia/.style={draw,cylinder,shape border rotate=90,aspect=0.4,minimum size=1cm}
+  ]
+
+  \node (e1)
+
+  \node (e1) [] {core1};
+  \node (e2) [right= 2.5cm of e1] {core2};
+
+  \node (e3) [below left= 2cm and 0mm of e1.center] {replicant1};
+  \node (e4) [right=of e3] {replicant2};
+  \node (e5) [right=of e4] {replicant3};
+
+  \begin{pgfonlayer}{back2}
+    \foreach \i in {1,...,5} {%
+      \node (mc\i) [mnesia,below=1mm of e\i] {};
+    }
+  \end{pgfonlayer}
+\end{tikzpicture}
+
+\end{document}
