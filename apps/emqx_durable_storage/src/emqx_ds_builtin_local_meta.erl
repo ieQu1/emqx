@@ -18,7 +18,15 @@
 -behavior(gen_server).
 
 %% API:
--export([start_link/0, open_db/2, shards/1, db_config/1, update_db_config/2, current_timestamp/0]).
+-export([
+    start_link/0,
+    open_db/2,
+    n_shards/1,
+    shards/1,
+    db_config/1,
+    update_db_config/2,
+    current_timestamp/0
+]).
 
 %% behavior callbacks:
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -74,10 +82,15 @@ update_db_config(DB, Opts) ->
         end
     ).
 
+-spec n_shards(emqx_ds:db()) -> pos_integer().
+n_shards(DB) ->
+    #{n_shards := NShards} = db_config(DB),
+    NShards.
+
 -spec shards(emqx_ds:db()) -> [emqx_ds_builtin_local:shard()].
 shards(DB) ->
-    #{n_shards := NShards} = db_config(DB),
-    [integer_to_binary(Shard) || Shard <- lists:seq(1, NShards)].
+    NShards = n_shards(DB),
+    [integer_to_binary(Shard) || Shard <- lists:seq(0, NShards - 1)].
 
 -spec db_config(emqx_ds:db()) -> emqx_ds_builtin_local:db_opts().
 db_config(DB) ->
@@ -88,6 +101,12 @@ db_config(DB) ->
             error({no_such_db, DB})
     end.
 
+%% Return a timestamp that is monotonic between the node restarts.
+%%
+%% This property is maintained using the following mechanism:
+%% - `local_meta' gen_server maintains two values as `atomics':
+%%    - `offset':
+%%
 -spec current_timestamp() -> emqx_ds:time().
 current_timestamp() ->
     %% TODO: make it monotonic between restarts
@@ -98,6 +117,7 @@ current_timestamp() ->
 %%================================================================================
 
 -record(s, {}).
+-define(timer_update, timer_update).
 
 init([]) ->
     process_flag(trap_exit, true),

@@ -23,6 +23,7 @@
 
 %% behavior callbacks:
 -export([
+    %% `emqx_ds':
     open_db/2,
     add_generation/1,
     update_db_config/2,
@@ -39,6 +40,8 @@
     delete_next/4,
     shard_of_message/3,
 
+    %% `emqx_ds_buffer':
+    init_buffer/3,
     flush_buffer/4,
     shard_of_message/4
 ]).
@@ -137,12 +140,24 @@ update_db_config(DB, CreateOpts) ->
 
 -spec list_generations_with_lifetimes(emqx_ds:db()) ->
     #{emqx_ds:generation_rank() => emqx_ds:generation_info()}.
-list_generations_with_lifetimes(_DB) ->
-    #{}.
+list_generations_with_lifetimes(DB) ->
+    lists:foldl(
+        fun(Shard, Acc) ->
+            maps:fold(
+                fun(GenId, Data, Acc1) ->
+                    Acc1#{{Shard, GenId} => Data}
+                end,
+                Acc,
+                emqx_ds_storage_layer:list_generations_with_lifetimes({DB, Shard})
+            )
+        end,
+        #{},
+        emqx_ds_builtin_local_meta:shards(DB)
+    ).
 
 -spec drop_generation(emqx_ds:db(), emqx_ds:generation_rank()) -> ok | {error, _}.
-drop_generation(_DB, _Rank) ->
-    ok.
+drop_generation(DB, {Shard, GenId}) ->
+    emqx_ds_storage_layer:drop_generation({DB, Shard}, GenId).
 
 -spec drop_db(emqx_ds:db()) -> ok | {error, _}.
 drop_db(_DB) ->
@@ -158,16 +173,47 @@ store_batch(DB, Messages, Opts) ->
             {error, recoverable, Reason}
     end.
 
--spec flush_buffer(emqx_ds:db(), shard(), [emqx_types:message()], _Options) -> ok.
-flush_buffer(DB, Shard, Messages, Options) ->
-    emqx_ds_storage_layer:store_batch(
-        {DB, Shard}, [{Msg#message.timestamp, Msg} || Msg <- Messages], Options
-    ).
+-record(bs, {options :: term(), latest :: integer()}).
+-type buffer_state() :: #bs{}.
+
+-spec init_buffer(emqx_ds:db(), shard(), _Options) -> {ok, buffer_state()}.
+init_buffer(DB, Shard, Options) ->
+    {ok, #bs{options = Options, latest = 0}}.
+
+-spec flush_buffer(emqx_ds:db(), shard(), [emqx_types:message()], buffer_state()) ->
+    {buffer_state(), emqx_ds:store_batch_result()}.
+flush_buffer(DB, Shard, Messages, S0 = #bs{options = Options, latest = Latest0}) ->
+    {Latest, Batch} = assign_timestamps(Latest0, Messages),
+    Result = emqx_ds_storage_layer:store_batch({DB, Shard}, Batch, Options),
+    {S0#bs{latest = Latest}, Result}.
+
+assign_timestamps(Latest, Messages) ->
+    assign_timestamps(Latest, Messages, []).
+
+assign_timestamps(Latest, [MessageIn | Rest], Acc) ->
+    case emqx_message:timestamp(MessageIn, microsecond) of
+        TimestampUs when TimestampUs > Latest ->
+            Message = assign_timestamp(TimestampUs, MessageIn),
+            assign_timestamps(TimestampUs, Rest, [Message | Acc]);
+        _Earlier ->
+            Message = assign_timestamp(Latest + 1, MessageIn),
+            assign_timestamps(Latest + 1, Rest, [Message | Acc])
+    end;
+assign_timestamps(Latest, [], Acc) ->
+    {Latest, lists:reverse(Acc)}.
+
+assign_timestamp(TimestampUs, Message) ->
+    {TimestampUs, Message}.
 
 -spec shard_of_message(emqx_ds:db(), emqx_types:message(), clientid | topic, _Options) -> shard().
-shard_of_message(_DB, _Message, clientid, _Options) ->
-    %% TODO:
-    <<"1">>.
+shard_of_message(DB, #message{from = From, topic = Topic}, SerializeBy, _Options) ->
+    N = emqx_ds_builtin_local_meta:n_shards(DB),
+    Hash =
+        case SerializeBy of
+            clientid -> erlang:phash2(From, N);
+            topic -> erlang:phash2(Topic, N)
+        end,
+    integer_to_binary(Hash).
 
 -spec get_streams(emqx_ds:db(), emqx_ds:topic_filter(), emqx_ds:time()) ->
     [{emqx_ds:stream_rank(), emqx_ds:ds_specific_stream()}].

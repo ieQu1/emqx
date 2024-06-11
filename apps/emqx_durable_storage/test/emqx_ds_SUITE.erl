@@ -155,93 +155,31 @@ t_05_update_iterator(_Config) ->
     ?assertEqual(Msgs, [Msg0 | Batch], #{from_key => Iter1, final_iter => Iter}),
     ok.
 
-t_06_update_config(_Config) ->
+t_06_smoke_add_generation(_Config) ->
     DB = ?FUNCTION_NAME,
     ?assertMatch(ok, emqx_ds:open_db(DB, opts())),
-    TopicFilter = ['#'],
+    ?assertMatch(
+        [{_, _}],
+        maps:to_list(emqx_ds:list_generations_with_lifetimes(DB))
+    ),
+    ?assertMatch(ok, emqx_ds:add_generation(DB)),
+    ?assertMatch(
+        [{_, _}, {_, _}],
+        maps:to_list(emqx_ds:list_generations_with_lifetimes(DB))
+    ).
 
-    DataSet = update_adta_set(),
-
-    ToMsgs = fun(Datas) ->
-        lists:map(
-            fun({Topic, Payload}) ->
-                message(Topic, Payload, emqx_message:timestamp_now())
-            end,
-            Datas
-        )
-    end,
-
-    {_, StartTimes, MsgsList} =
-        lists:foldl(
-            fun
-                (Datas, {true, TimeAcc, MsgAcc}) ->
-                    Msgs = ToMsgs(Datas),
-                    ?assertMatch(ok, emqx_ds:store_batch(DB, Msgs)),
-                    {false, TimeAcc, [Msgs | MsgAcc]};
-                (Datas, {Any, TimeAcc, MsgAcc}) ->
-                    timer:sleep(500),
-                    ?assertMatch(ok, emqx_ds:update_db_config(DB, opts())),
-                    timer:sleep(500),
-                    StartTime = emqx_message:timestamp_now(),
-                    Msgs = ToMsgs(Datas),
-                    ?assertMatch(ok, emqx_ds:store_batch(DB, Msgs)),
-                    {Any, [StartTime | TimeAcc], [Msgs | MsgAcc]}
-            end,
-            {true, [emqx_message:timestamp_now()], []},
-            DataSet
-        ),
-
-    Checker = fun({StartTime, Msgs0}, Acc) ->
-        Msgs = Acc ++ Msgs0,
-        Batch = emqx_ds_test_helpers:consume(DB, TopicFilter, StartTime),
-        ?assertEqual(Msgs, Batch, StartTime),
-        Msgs
-    end,
-    lists:foldl(Checker, [], lists:zip(StartTimes, MsgsList)).
-
-t_07_add_generation(_Config) ->
+t_07_smoke_update_config(_Config) ->
     DB = ?FUNCTION_NAME,
     ?assertMatch(ok, emqx_ds:open_db(DB, opts())),
-    TopicFilter = ['#'],
-
-    DataSet = update_data_set(),
-
-    ToMsgs = fun(Datas) ->
-        lists:map(
-            fun({Topic, Payload}) ->
-                message(Topic, Payload, emqx_message:timestamp_now())
-            end,
-            Datas
-        )
-    end,
-
-    {_, StartTimes, MsgsList} =
-        lists:foldl(
-            fun
-                (Datas, {true, TimeAcc, MsgAcc}) ->
-                    Msgs = ToMsgs(Datas),
-                    ?assertMatch(ok, emqx_ds:store_batch(DB, Msgs)),
-                    {false, TimeAcc, [Msgs | MsgAcc]};
-                (Datas, {Any, TimeAcc, MsgAcc}) ->
-                    timer:sleep(500),
-                    ?assertMatch(ok, emqx_ds:add_generation(DB)),
-                    timer:sleep(500),
-                    StartTime = emqx_message:timestamp_now(),
-                    Msgs = ToMsgs(Datas),
-                    ?assertMatch(ok, emqx_ds:store_batch(DB, Msgs)),
-                    {Any, [StartTime | TimeAcc], [Msgs | MsgAcc]}
-            end,
-            {true, [emqx_message:timestamp_now()], []},
-            DataSet
-        ),
-
-    Checker = fun({StartTime, Msgs0}, Acc) ->
-        Msgs = Acc ++ Msgs0,
-        Batch = emqx_ds_test_helpers:consume(DB, TopicFilter, StartTime),
-        ?assertEqual(Msgs, Batch, StartTime),
-        Msgs
-    end,
-    lists:foldl(Checker, [], lists:zip(StartTimes, MsgsList)).
+    ?assertMatch(
+        [{_, _}],
+        maps:to_list(emqx_ds:list_generations_with_lifetimes(DB))
+    ),
+    ?assertMatch(ok, emqx_ds:update_db_config(DB, opts())),
+    ?assertMatch(
+        [{_, _}, {_, _}],
+        maps:to_list(emqx_ds:list_generations_with_lifetimes(DB))
+    ).
 
 %% Verifies the basic usage of `list_generations_with_lifetimes' and `drop_generation'...
 %%   1) Cannot drop current generation.
@@ -709,7 +647,7 @@ t_store_batch_fail(_Config) ->
             ),
             %% Inject a recoveralbe error:
             meck:expect(emqx_ds_storage_layer, store_batch, fun(_DB, _Shard, _Messages) ->
-                {timeout, mock}
+                {error, recoverable, mock}
             end),
             Batch3 = [
                 message(<<"C1">>, <<"foo/bar">>, <<"5">>, 2),
@@ -720,7 +658,7 @@ t_store_batch_fail(_Config) ->
             %% Note: due to idempotency issues the number of retries
             %% is currently set to 0:
             ?assertMatch(
-                {error, recoverable, {timeout, mock}},
+                {error, recoverable, mock},
                 emqx_ds:store_batch(DB, Batch3, #{sync => true})
             ),
             meck:unload(emqx_ds_storage_layer),
@@ -731,22 +669,24 @@ t_store_batch_fail(_Config) ->
         end,
         [
             {"message ordering", fun(StoredMessages, _Trace) ->
-                [{_, Stream1}, {_, Stream2}] = StoredMessages,
-                ?assertMatch(
+                [{_, MessagesFromStream1}, {_, MessagesFromStream2}] = StoredMessages,
+                emqx_ds_test_helpers:diff_messages(
+                    [payload],
                     [
                         #message{payload = <<"1">>},
                         #message{payload = <<"2">>},
                         #message{payload = <<"5">>},
                         #message{payload = <<"7">>}
                     ],
-                    Stream1
+                    MessagesFromStream1
                 ),
-                ?assertMatch(
+                emqx_ds_test_helpers:diff_messages(
+                    [payload],
                     [
                         #message{payload = <<"6">>},
                         #message{payload = <<"8">>}
                     ],
-                    Stream2
+                    MessagesFromStream2
                 )
             end}
         ]

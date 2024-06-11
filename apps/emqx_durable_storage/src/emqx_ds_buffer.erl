@@ -51,10 +51,12 @@
     payload_bytes :: non_neg_integer()
 }).
 
--callback flush_buffer(emqx_ds:db(), _Shard, [emqx_types:message()], _Options) ->
-    ok | {timeout, _} | {error, recoverable | unrecoverable, _Err}.
+-callback init_buffer(emqx_ds:db(), _Shard, _Options) -> {ok, _State}.
 
--callback shard_of_message(emqx_ds:db(), emqx_types:message(), topic | clientid, _Options) ->
+-callback flush_buffer(emqx_ds:db(), _Shard, [emqx_types:message()], State) ->
+    {ok, State} | {error, recoverable | unrecoverable, _Err}.
+
+-callback shard_of_message(emqx_ds:db(), emqx_types:message(), topic | clientid, _Options, _State) ->
     _Shard.
 
 %%================================================================================
@@ -103,7 +105,7 @@ store_batch(DB, Messages, Opts) ->
 
 -record(s, {
     callback_module :: module(),
-    callback_options :: term(),
+    callback_state :: term(),
     db :: emqx_ds:db(),
     shard :: emqx_ds_replication_layer:shard_id(),
     metrics_id :: emqx_ds_builtin_metrics:shard_metrics_id(),
@@ -125,9 +127,10 @@ init([CBM, CBMOptions, DB, Shard]) ->
     logger:update_process_metadata(#{domain => [emqx, ds, egress, DB]}),
     MetricsId = emqx_ds_builtin_metrics:shard_metric_id(DB, Shard),
     ok = emqx_ds_builtin_metrics:init_for_shard(MetricsId),
+    {ok, CallbackS} = CBM:init_buffer(DB, Shard, CBMOptions),
     S = #s{
         callback_module = CBM,
-        callback_options = CBMOptions,
+        callback_state = CallbackS,
         db = DB,
         shard = Shard,
         metrics_id = MetricsId,
@@ -246,9 +249,9 @@ flush(S) ->
 do_flush(S0 = #s{n = 0}) ->
     S0;
 do_flush(
-    S = #s{
+    S0 = #s{
         callback_module = CBM,
-        callback_options = CBMOptions,
+        callback_state = CallbackS0,
         queue = Q,
         pending_replies = Replies,
         db = DB,
@@ -260,7 +263,8 @@ do_flush(
 ) ->
     Messages = queue:to_list(Q),
     T0 = erlang:monotonic_time(microsecond),
-    Result = CBM:flush_buffer(DB, Shard, Messages, CBMOptions),
+    {CallbackS, Result} = CBM:flush_buffer(DB, Shard, Messages, CallbackS0),
+    S = S0#s{callback_state = CallbackS},
     T1 = erlang:monotonic_time(microsecond),
     emqx_ds_builtin_metrics:observe_egress_flush_time(Metrics, T1 - T0),
     case Result of
@@ -275,6 +279,7 @@ do_flush(
             lists:foreach(fun(From) -> gen_server:reply(From, ok) end, Replies),
             erlang:garbage_collect(),
             S#s{
+                callback_state = CallbackS,
                 n = 0,
                 n_bytes = 0,
                 queue = queue:new(),
@@ -353,7 +358,7 @@ shards_of_batch(DB, Messages) ->
 repackage_messages(DB, Messages, Sync) ->
     Batches = lists:foldl(
         fun(Message, Acc) ->
-            Shard = emqx_ds_replication_layer:shard_of_message(DB, Message, clientid),
+            Shard = shard_of_message(DB, Message, clientid),
             Size = payload_size(Message),
             maps:update_with(
                 Shard,
