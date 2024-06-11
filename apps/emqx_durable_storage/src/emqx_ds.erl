@@ -26,6 +26,7 @@
     register_backend/2,
 
     open_db/2,
+    close_db/1,
     update_db_config/2,
     add_generation/1,
     list_generations_with_lifetimes/1,
@@ -200,6 +201,8 @@
 
 -callback open_db(db(), create_db_opts()) -> ok | {error, _}.
 
+-callback close_db(db()) -> ok.
+
 -callback add_generation(db()) -> ok | {error, _}.
 
 -callback update_db_config(db(), create_db_opts()) -> ok | {error, _}.
@@ -264,6 +267,10 @@ open_db(DB, Opts = #{backend := Backend}) ->
             persistent_term:put(?persistent_term(DB), Module),
             ?module(DB):open_db(DB, Opts)
     end.
+
+-spec close_db(db()) -> ok.
+close_db(DB) ->
+    ?module(DB):close_db(DB).
 
 -spec add_generation(db()) -> ok.
 add_generation(DB) ->

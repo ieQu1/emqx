@@ -25,6 +25,7 @@
 -export([
     %% `emqx_ds':
     open_db/2,
+    close_db/1,
     add_generation/1,
     update_db_config/2,
     list_generations_with_lifetimes/1,
@@ -105,6 +106,10 @@ open_db(DB, CreateOpts) ->
         {error, Err} ->
             {error, Err}
     end.
+
+-spec close_db(emqx_ds:db()) -> ok.
+close_db(DB) ->
+    emqx_ds_builtin_local_sup:stop_db(DB).
 
 -spec add_generation(emqx_ds:db()) -> ok | {error, _}.
 add_generation(DB) ->
