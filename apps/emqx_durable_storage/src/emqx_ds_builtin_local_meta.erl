@@ -25,7 +25,10 @@
     shards/1,
     db_config/1,
     update_db_config/2,
-    current_timestamp/0
+
+    current_timestamp/1,
+    set_current_timestamp/2,
+    ensure_monotonic_timestamp/1
 ]).
 
 %% behavior callbacks:
@@ -41,10 +44,19 @@
 %%================================================================================
 
 -define(META_TAB, emqx_ds_builtin_local_metadata_tab).
-
 -record(?META_TAB, {
     db :: emqx_ds:db(),
     db_props :: emqx_ds_builtin_local:db_opts()
+}).
+
+%% We save timestamp of the last written message to a mnesia table.
+%% The saved value is restored when the node restarts. This is needed
+%% to create a timestamp that is truly monotonic even in presence of
+%% node restarts.
+-define(TS_TAB, emqx_ds_builtin_local_timestamp_tab).
+-record(?TS_TAB, {
+    id :: emqx_ds_storage_layer:shard_id(),
+    latest :: integer()
 }).
 
 %%================================================================================
@@ -101,16 +113,28 @@ db_config(DB) ->
             error({no_such_db, DB})
     end.
 
+-spec set_current_timestamp(emqx_ds_storage_layer:shard_id(), emqx_ds:time()) -> ok.
+set_current_timestamp(ShardId, Time) ->
+    mria:dirty_write(?TS_TAB, #?TS_TAB{id = ShardId, latest = Time}).
+
 %% Return a timestamp that is monotonic between the node restarts.
 %%
 %% This property is maintained using the following mechanism:
 %% - `local_meta' gen_server maintains two values as `atomics':
 %%    - `offset':
 %%
--spec current_timestamp() -> emqx_ds:time().
-current_timestamp() ->
-    %% TODO: make it monotonic between restarts
-    erlang:system_time(microsecond).
+-spec current_timestamp(emqx_ds_storage_layer:shard_id()) -> emqx_ds:time() | undefined.
+current_timestamp(ShardId) ->
+    case mnesia:dirty_read(?TS_TAB, ShardId) of
+        [#?TS_TAB{latest = Latest}] ->
+            Latest;
+        [] ->
+            undefined
+    end.
+
+-spec ensure_monotonic_timestamp(emqx_ds_storage_layer:shard()) -> emqx_ds:time().
+ensure_monotonic_timestamp(ShardId) ->
+    mria:dirty_update_counter({?TS_TAB, ShardId}, 1).
 
 %%================================================================================
 %% behavior callbacks
@@ -152,6 +176,13 @@ ensure_tables() ->
         {storage, disc_copies},
         {record_name, ?META_TAB},
         {attributes, record_info(fields, ?META_TAB)}
+    ]),
+    ok = mria:create_table(?TS_TAB, [
+        {local_content, true},
+        {type, set},
+        {storage, disc_copies},
+        {record_name, ?TS_TAB},
+        {attributes, record_info(fields, ?TS_TAB)}
     ]).
 
 transaction(Fun) ->

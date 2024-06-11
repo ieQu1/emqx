@@ -46,9 +46,6 @@
     shard_of_message/4
 ]).
 
-%% internal exports:
--export([current_timestamp/0]).
-
 -export_type([iterator/0, delete_iterator/0]).
 
 -include_lib("emqx_utils/include/emqx_message.hrl").
@@ -114,7 +111,12 @@ add_generation(DB) ->
     Shards = emqx_ds_builtin_local_meta:shards(DB),
     Errors = lists:filtermap(
         fun(Shard) ->
-            case emqx_ds_storage_layer:add_generation({DB, Shard}, current_timestamp()) of
+            ShardId = {DB, Shard},
+            case
+                emqx_ds_storage_layer:add_generation(
+                    ShardId, emqx_ds_builtin_local_meta:ensure_monotonic_timestamp(ShardId)
+                )
+            of
                 ok ->
                     false;
                 Error ->
@@ -133,7 +135,10 @@ update_db_config(DB, CreateOpts) ->
     Opts = #{} = emqx_ds_builtin_local_meta:update_db_config(DB, CreateOpts),
     lists:foreach(
         fun(Shard) ->
-            emqx_ds_storage_layer:update_config({DB, Shard}, current_timestamp(), Opts)
+            ShardId = {DB, Shard},
+            emqx_ds_storage_layer:update_config(
+                ShardId, emqx_ds_builtin_local_meta:ensure_monotonic_timestamp(ShardId), Opts
+            )
         end,
         emqx_ds_builtin_local_meta:shards(DB)
     ).
@@ -173,19 +178,28 @@ store_batch(DB, Messages, Opts) ->
             {error, recoverable, Reason}
     end.
 
--record(bs, {options :: term(), latest :: integer()}).
+-record(bs, {options :: term()}).
 -type buffer_state() :: #bs{}.
 
 -spec init_buffer(emqx_ds:db(), shard(), _Options) -> {ok, buffer_state()}.
 init_buffer(DB, Shard, Options) ->
-    {ok, #bs{options = Options, latest = 0}}.
+    ShardId = {DB, Shard},
+    case current_timestamp(ShardId) of
+        undefined ->
+            Latest = erlang:system_time(microsecond),
+            emqx_ds_builtin_local_meta:set_current_timestamp(ShardId, Latest);
+        Latest ->
+            ok
+    end,
+    {ok, #bs{options = Options}}.
 
 -spec flush_buffer(emqx_ds:db(), shard(), [emqx_types:message()], buffer_state()) ->
     {buffer_state(), emqx_ds:store_batch_result()}.
-flush_buffer(DB, Shard, Messages, S0 = #bs{options = Options, latest = Latest0}) ->
-    {Latest, Batch} = assign_timestamps(Latest0, Messages),
+flush_buffer(DB, Shard, Messages, S0 = #bs{options = Options}) ->
+    {Latest, Batch} = assign_timestamps(current_timestamp({DB, Shard}), Messages),
     Result = emqx_ds_storage_layer:store_batch({DB, Shard}, Batch, Options),
-    {S0#bs{latest = Latest}, Result}.
+    emqx_ds_builtin_local_meta:set_current_timestamp({DB, Shard}, Latest),
+    {S0, Result}.
 
 assign_timestamps(Latest, Messages) ->
     assign_timestamps(Latest, Messages, []).
@@ -262,7 +276,7 @@ update_iterator(DB, Iter0 = #{?tag := ?IT, ?shard := Shard, ?enc := StorageIter0
 next(DB, Iter0 = #{?tag := ?IT, ?shard := Shard, ?enc := StorageIter0}, N) ->
     ShardId = {DB, Shard},
     T0 = erlang:monotonic_time(microsecond),
-    Result = emqx_ds_storage_layer:next(ShardId, StorageIter0, N, current_timestamp()),
+    Result = emqx_ds_storage_layer:next(ShardId, StorageIter0, N, current_timestamp(ShardId)),
     T1 = erlang:monotonic_time(microsecond),
     emqx_ds_builtin_metrics:observe_next_time(DB, T1 - T0),
     case Result of
@@ -308,7 +322,9 @@ make_delete_iterator(DB, ?delete_stream(Shard, InnerStream), TopicFilter, StartT
 delete_next(DB, Iter = #{?tag := ?DELETE_IT, ?shard := Shard, ?enc := StorageIter0}, Selector, N) ->
     ShardId = {DB, Shard},
     case
-        emqx_ds_storage_layer:delete_next(ShardId, StorageIter0, Selector, N, current_timestamp())
+        emqx_ds_storage_layer:delete_next(
+            ShardId, StorageIter0, Selector, N, current_timestamp(ShardId)
+        )
     of
         {ok, StorageIter, Ndeleted} ->
             {ok, Iter#{?enc => StorageIter}, Ndeleted};
@@ -322,8 +338,8 @@ delete_next(DB, Iter = #{?tag := ?DELETE_IT, ?shard := Shard, ?enc := StorageIte
 %% Internal exports
 %%================================================================================
 
-current_timestamp() ->
-    emqx_ds_builtin_local_meta:current_timestamp().
+current_timestamp(ShardId) ->
+    emqx_ds_builtin_local_meta:current_timestamp(ShardId).
 
 -spec shard_of_message(emqx_ds:db(), emqx_types:message(), clientid | topic) ->
     emqx_ds_replication_layer:shard_id().
