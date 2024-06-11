@@ -295,9 +295,6 @@ drop_generation(DB, GenId) ->
             {error, not_implemented}
     end.
 
-%% @doc TODO: currently if one or a few shards are down, they won't be
-
-%% deleted.
 -spec drop_db(db()) -> ok.
 drop_db(DB) ->
     case persistent_term:get(?persistent_term(DB), undefined) of

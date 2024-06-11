@@ -19,5 +19,4 @@
 -export([start/2]).
 
 start(_Type, _Args) ->
-    emqx_ds:register_backend(builtin, emqx_ds_replication_layer),
-    emqx_ds_sup:start_link().
+    emqx_ds:register_backend(builtin_raft, emqx_ds_replication_layer),

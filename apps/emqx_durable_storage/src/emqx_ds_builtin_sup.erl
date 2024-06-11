@@ -15,7 +15,7 @@
 %%--------------------------------------------------------------------
 
 %% @doc This supervisor manages the global worker processes needed for
-%% the functioning of builtin databases, and all builtin database
+%% the functioning of builtin databases, and all builtin databases
 %% attach to it.
 -module(emqx_ds_builtin_sup).
 

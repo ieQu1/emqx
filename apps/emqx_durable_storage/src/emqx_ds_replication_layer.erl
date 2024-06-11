@@ -229,6 +229,8 @@ list_generations_with_lifetimes(DB) ->
 drop_generation(DB, {Shard, GenId}) ->
     ra_drop_generation(DB, Shard, GenId).
 
+%% @doc TODO: currently if one or a few shards are down, they won't be
+%% deleted.
 -spec drop_db(emqx_ds:db()) -> ok | {error, _}.
 drop_db(DB) ->
     foreach_shard(DB, fun(Shard) ->
