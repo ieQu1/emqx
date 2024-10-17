@@ -38,6 +38,7 @@
 
     unpack_iterator/3,
     scan_stream/8,
+    next_key/5,
     message_matcher/3,
 
     batch_events/2
@@ -356,6 +357,9 @@ scan_stream(Shard, S, StaticIdx, Varying, LastSeenKey, BatchSize, TMax, IsCurren
         Other ->
             Other
     end.
+
+next_key(_Shard, _S, committed, StaticIdx, Now) ->
+    {ok, mk_key(StaticIdx, 0, <<>>, Now)}.
 
 make_delete_iterator(Shard, Data, Stream, TopicFilter, StartTime) ->
     make_iterator(Shard, Data, Stream, TopicFilter, StartTime).

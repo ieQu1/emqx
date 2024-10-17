@@ -41,6 +41,7 @@
     generation/1,
     unpack_iterator/2,
     scan_stream/6,
+    next_key/4,
 
     delete_next/5,
 
@@ -326,6 +327,9 @@
 
 -callback handle_event(shard_id(), generation_data(), emqx_ds:time(), CustomEvent | tick) ->
     [CustomEvent].
+
+-callback next_key(shard_id(), generation_data(), committed, _Stream, emqx_ds:time()) ->
+    {ok, emqx_ds:key()} | emqx_ds:error().
 
 %% Stream event API:
 
@@ -630,6 +634,14 @@ scan_stream(
             Mod:scan_stream(
                 Shard, GenData, Inner, TopicFilter, StartMsg, BatchSize, Now, IsCurrent
             );
+        not_found ->
+            ?ERR_GEN_GONE
+    end.
+
+next_key(Shard, committed, ?stream_v2(GenId, Inner), Now) ->
+    case generation_get(Shard, GenId) of
+        #{module := Mod, data := GenData} ->
+            Mod:next_key(Shard, GenData, committed, Inner, Now);
         not_found ->
             ?ERR_GEN_GONE
     end.

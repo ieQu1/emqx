@@ -43,6 +43,7 @@
 
     unpack_iterator/3,
     scan_stream/8,
+    next_key/5,
     message_matcher/3,
     batch_events/2
 ]).
@@ -684,6 +685,9 @@ scan_stream(Shard, S, Stream, TopicFilter, LastSeenKey, BatchSize, TMax, IsCurre
         Other ->
             Other
     end.
+
+next_key(_Shard, _State, committed, _Stream, _Now) ->
+    error(not_implemented).
 
 message_matcher(_Shard, #s{}, #{?tag := ?IT, ?last_seen_key := LSK, ?topic_filter := TF}) ->
     fun(MsgKey, #message{topic = Topic}) ->

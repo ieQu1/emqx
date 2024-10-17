@@ -191,7 +191,7 @@
     events :: [{_Stream, event_topic()}]
 }).
 
--define(fulfill_loop, fulfill_loop).
+-define(fulfill_loop, beamformer_fulfill_loop).
 -define(housekeeping_loop, housekeeping_loop).
 
 %%================================================================================
@@ -216,6 +216,10 @@
 
 -callback scan_stream(_Shard, _Stream, _TopicFilter, _StartKey, _BatchSize :: non_neg_integer()) ->
     stream_scan_return().
+
+%% Note: called for every incoming poll request!
+-callback next_key(_Shard, committed, _Stream) -> {ok, emqx_ds:key()} | emqx_ds:error().
+%% -callback classify_key(_Shard, _Stream, emqx_ds:key()) -> {ok, old | fresh | future} | emqx_ds:error().
 
 %%================================================================================
 %% API functions
@@ -332,7 +336,7 @@ init([CBM, ShardId, Name, _Opts]) ->
 handle_call(
     Req = #poll_req{},
     _From,
-    S = #s{pending_queue = PendingTab, wait_queue = WaitingTab, metrics_id = Metrics}
+    S0 = #s{pending_queue = PendingTab, wait_queue = WaitingTab, metrics_id = Metrics}
 ) ->
     %% FIXME
     %% this is a potentially costly operation
@@ -340,17 +344,36 @@ handle_call(
     WQLen = ets:info(WaitingTab, size),
     emqx_ds_builtin_metrics:set_pendingq_len(Metrics, PQLen),
     emqx_ds_builtin_metrics:set_waitq_len(Metrics, WQLen),
-    case PQLen + WQLen >= S#s.pending_request_limit of
+    case PQLen + WQLen >= S0#s.pending_request_limit of
         true ->
             emqx_ds_builtin_metrics:inc_poll_requests_dropped(Metrics, 1),
             Reply = {error, recoverable, too_many_requests},
-            {reply, Reply, S};
+            {reply, Reply, S0};
         false ->
-            ets:insert(S#s.pending_queue, Req),
-            {reply, ok, ensure_fulfill_loop(S)}
+            {Result, S} = enqueue(Req, S0),
+            {reply, Result, S}
     end;
 handle_call(_Call, _From, S) ->
     {reply, {error, unknown_call}, S}.
+
+enqueue(
+    Req = #poll_req{key = {Stream, TopicFilter, Key}, return_addr = Id},
+    S = #s{pending_queue = PendingTab, wait_queue = WaitingTab, module = CBM, shard = ShardId}
+) ->
+    %% Check if the request belongs to committed range:
+    case CBM:next_key(ShardId, committed, Stream) of
+        {ok, NextKey} when Key >= NextKey ->
+            %% logger:warning("enqueue w~p~n  ~p", [HighWM, Req]),
+            emqx_ds_beamformer_waitq:insert(Stream, TopicFilter, Id, Req, WaitingTab),
+            {ok, S};
+        {ok, _HighWM} ->
+            %% logger:warning("enqueue p~p~n  ~p", [HighWM, Req]),
+            ets:insert(PendingTab, Req),
+            ensure_fulfill_loop(),
+            {ok, S};
+        Error = {error, _, _} ->
+            {Error, S}
+    end.
 
 handle_cast(_Cast, S) ->
     {noreply, S}.
@@ -359,8 +382,8 @@ handle_info(#shard_event{events = Events}, S) ->
     ?tp(debug, emqx_ds_beamformer_event, #{events => Events}),
     {noreply, maybe_fulfill_waiting(S, Events)};
 handle_info(?fulfill_loop, S0) ->
-    S1 = S0#s{is_spinning = false},
-    S = fulfill_pending(S1),
+    put(?fulfill_loop, false),
+    S = fulfill_pending(S0),
     {noreply, S};
 handle_info(?housekeeping_loop, S0) ->
     %% Reload configuration according from environment variables:
@@ -403,12 +426,16 @@ do_dispatch(Beam = #beam{}) ->
 %% Internal functions
 %%================================================================================
 
--spec ensure_fulfill_loop(s()) -> s().
-ensure_fulfill_loop(S = #s{is_spinning = true}) ->
-    S;
-ensure_fulfill_loop(S = #s{is_spinning = false}) ->
-    self() ! ?fulfill_loop,
-    S#s{is_spinning = true}.
+-spec ensure_fulfill_loop() -> ok.
+ensure_fulfill_loop() ->
+    case get(?fulfill_loop) of
+        true ->
+            ok;
+        _ ->
+            put(?fulfill_loop, true),
+            self() ! ?fulfill_loop,
+            ok
+    end.
 
 -spec cleanup(s()) -> s().
 cleanup(S = #s{pending_queue = PendingTab, wait_queue = WaitingTab, metrics_id = Metrics}) ->
@@ -425,15 +452,16 @@ do_cleanup(Metrics, Tab) ->
 -spec fulfill_pending(s()) -> s().
 fulfill_pending(S = #s{pending_queue = PendingTab}) ->
     %% debug_pending(S),
-    case find_older_request(PendingTab, 100) of
+    case find_pending(PendingTab, 100) of
         undefined ->
             S;
-        Req ->
-            ?tp(emqx_ds_beamformer_fulfill_pending, #{req => Req}),
+        {Stream, TopicFilter, StartKey} ->
+            ?tp(emqx_ds_beamformer_fulfill_pending, #{stream => Stream, topic => TopicFilter, start_key => StartKey}),
             %% The function MUST destructively consume all requests
             %% matching stream and MsgKey to avoid infinite loop:
-            do_fulfill_pending(S, Req),
-            ensure_fulfill_loop(S)
+            do_fulfill_pending(S, Stream, TopicFilter, StartKey),
+            ensure_fulfill_loop(),
+            S
     end.
 
 do_fulfill_pending(
@@ -443,7 +471,7 @@ do_fulfill_pending(
         pending_queue = PendingTab,
         batch_size = BatchSize
     },
-    #poll_req{key = {Stream, TopicFilter, StartKey}}
+    Stream, TopicFilter, StartKey
 ) ->
     OnMatch = fun(_) -> ok end,
     %% Here we only group requests with exact match of the topic
@@ -553,14 +581,14 @@ map_pushl(Key, Elem, Map) ->
 %% request. It simply compares the keys (and nothing else) within a
 %% small sample of pending polls, and picks request with the smallest
 %% key as the starting point.
-find_older_request(Tab, SampleSize) ->
+find_pending(Tab, SampleSize) ->
     MS = {'_', [], ['$_']},
     case ets:select(Tab, [MS], SampleSize) of
         '$end_of_table' ->
             undefined;
         {[Fst | Rest], _Cont} ->
             %% Find poll request with the minimal key:
-            lists:foldl(
+            Oldest = lists:foldl(
                 fun(E, Acc) ->
                     case ds_key_of_poll(E) < ds_key_of_poll(Acc) of
                         true -> E;
@@ -569,7 +597,8 @@ find_older_request(Tab, SampleSize) ->
                 end,
                 Fst,
                 Rest
-            )
+            ),
+            Oldest#poll_req.key
     end.
 
 %% @doc Split beam into individual batches

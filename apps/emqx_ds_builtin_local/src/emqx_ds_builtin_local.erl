@@ -45,6 +45,7 @@
     %% `beamformer':
     unpack_iterator/2,
     scan_stream/5,
+    next_key/3,
 
     %% `emqx_ds_buffer':
     init_buffer/3,
@@ -430,6 +431,10 @@ scan_stream(ShardId, Stream, TopicFilter, StartMsg, BatchSize) ->
     T1 = erlang:monotonic_time(microsecond),
     emqx_ds_builtin_metrics:observe_next_time(DB, T1 - T0),
     Result.
+
+next_key(ShardId, committed, Stream) ->
+    Now = current_timestamp(ShardId),
+    emqx_ds_storage_layer:next_key(ShardId, committed, Stream, Now).
 
 -spec get_delete_streams(emqx_ds:db(), emqx_ds:topic_filter(), emqx_ds:time()) ->
     [emqx_ds:ds_specific_delete_stream()].
