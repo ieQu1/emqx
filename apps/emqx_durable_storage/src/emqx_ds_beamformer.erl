@@ -91,7 +91,8 @@
     return_addr/1,
     unpack_iterator_result/1,
     event_topic/0,
-    stream_scan_return/0
+    stream_scan_return/0,
+    iterator_type/0
 ]).
 
 -include_lib("snabbkaffe/include/trace.hrl").
@@ -194,6 +195,31 @@
 -define(fulfill_loop, beamformer_fulfill_loop).
 -define(housekeeping_loop, housekeeping_loop).
 
+%% When beamformer receives a poll request it can fulfill it using
+%% three different strategies:
+%%
+%% 1. `future' iterators point to the tip of the stream. They will be
+%% fulfilled by new data. Poll requests for such iterators are sent to
+%% the waiting queue, where they stay put awaiting the event.
+%%
+%% 2. `fresh' iterators point to the existing data that is relatively
+%% fresh (as decided by the backend). For fresh iterators beamformer
+%% uses wildcard topic filter (bypassing any internal index lookup or
+%% filtering that backend may use to avoid) in hope that multiple
+%% in-sync consumers may reuse the DB query.
+%%
+%% 3. `old' iterators point to the exising data that was committed
+%% long time ago. Beamformer uses pessimistic strategy when fulfilling
+%% "old" poll requests. It doesn't try to agressively group old poll
+%% requests, and instead relies on the backend's internal filtering.
+%%
+%% Note: marking iterators as `fresh' is an optional optimization. The
+%% backend MAY only use `future' and `old' types.
+%%
+%% The backend MUST send shard events for all changes that happen
+%% after it reported matching iterator as `future'.
+-type iterator_type() :: old | fresh | future.
+
 %%================================================================================
 %% Callbacks
 %%================================================================================
@@ -217,9 +243,13 @@
 -callback scan_stream(_Shard, _Stream, _TopicFilter, _StartKey, _BatchSize :: non_neg_integer()) ->
     stream_scan_return().
 
+%% Once poll request is received by the beamformer, it asks the
+%% backend to classify it. This is not done in `unpack_iterator' to
+%% make sure iterators are classified as `future' (and sent to the
+%% waiting queue) _before_ event is received.
+%%
 %% Note: called for every incoming poll request!
--callback next_key(_Shard, committed, _Stream) -> {ok, emqx_ds:key()} | emqx_ds:error().
-%% -callback classify_key(_Shard, _Stream, emqx_ds:key()) -> {ok, old | fresh | future} | emqx_ds:error().
+-callback classify_iterator(_Shard, _Iterator) -> {ok, iterator_type()} | emqx_ds:error().
 
 %%================================================================================
 %% API functions
@@ -357,22 +387,20 @@ handle_call(_Call, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
 enqueue(
-    Req = #poll_req{key = {Stream, TopicFilter, Key}, return_addr = Id},
+    Req = #poll_req{key = {Stream, TopicFilter, Key}, it = It0, return_addr = Id},
     S = #s{pending_queue = PendingTab, wait_queue = WaitingTab, module = CBM, shard = ShardId}
 ) ->
     %% Check if the request belongs to committed range:
-    case CBM:next_key(ShardId, committed, Stream) of
-        {ok, NextKey} when Key >= NextKey ->
+    case CBM:classify_iterator(ShardId, It0) of
+        future ->
             %% logger:warning("enqueue w~p~n  ~p", [HighWM, Req]),
             emqx_ds_beamformer_waitq:insert(Stream, TopicFilter, Id, Req, WaitingTab),
             {ok, S};
-        {ok, _HighWM} ->
+        _ ->
             %% logger:warning("enqueue p~p~n  ~p", [HighWM, Req]),
             ets:insert(PendingTab, Req),
             ensure_fulfill_loop(),
-            {ok, S};
-        Error = {error, _, _} ->
-            {Error, S}
+            {ok, S}
     end.
 
 handle_cast(_Cast, S) ->

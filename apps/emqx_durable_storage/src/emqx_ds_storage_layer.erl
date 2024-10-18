@@ -41,7 +41,7 @@
     generation/1,
     unpack_iterator/2,
     scan_stream/6,
-    next_key/4,
+    classify_iterator/3,
 
     delete_next/5,
 
@@ -328,8 +328,8 @@
 -callback handle_event(shard_id(), generation_data(), emqx_ds:time(), CustomEvent | tick) ->
     [CustomEvent].
 
--callback next_key(shard_id(), generation_data(), committed, _Stream, emqx_ds:time()) ->
-    {ok, emqx_ds:key()} | emqx_ds:error().
+-callback classify_iterator(shard_id(), generation_data(), _Iterator, emqx_ds:time()) ->
+    {ok, emqx_ds_beamformer:iterator_type()} | emqx_ds:error().
 
 %% Stream event API:
 
@@ -638,10 +638,10 @@ scan_stream(
             ?ERR_GEN_GONE
     end.
 
-next_key(Shard, committed, ?stream_v2(GenId, Inner), Now) ->
+classify_iterator(Shard, #{?tag := ?IT, ?generation := ?GenId ?enc := Inner}, Now) ->
     case generation_get(Shard, GenId) of
         #{module := Mod, data := GenData} ->
-            Mod:next_key(Shard, GenData, committed, Inner, Now);
+            Mod:classify_iterator(Shard, GenData, Inner, Now);
         not_found ->
             ?ERR_GEN_GONE
     end.
