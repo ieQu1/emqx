@@ -43,7 +43,7 @@
 
     unpack_iterator/3,
     scan_stream/8,
-    next_key/5,
+    classify_iterator/4,
     message_matcher/3,
     batch_events/2
 ]).
@@ -686,7 +686,7 @@ scan_stream(Shard, S, Stream, TopicFilter, LastSeenKey, BatchSize, TMax, IsCurre
             Other
     end.
 
-next_key(_Shard, _State, committed, _Stream, _Now) ->
+classify_iterator(_Shard, _State, _It, _Now) ->
     error(not_implemented).
 
 message_matcher(_Shard, #s{}, #{?tag := ?IT, ?last_seen_key := LSK, ?topic_filter := TF}) ->

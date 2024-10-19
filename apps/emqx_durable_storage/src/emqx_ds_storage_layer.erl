@@ -329,7 +329,7 @@
     [CustomEvent].
 
 -callback classify_iterator(shard_id(), generation_data(), _Iterator, emqx_ds:time()) ->
-    {ok, emqx_ds_beamformer:iterator_type()} | emqx_ds:error().
+    emqx_ds_beamformer:iterator_type().
 
 %% Stream event API:
 
@@ -638,10 +638,10 @@ scan_stream(
             ?ERR_GEN_GONE
     end.
 
-classify_iterator(Shard, #{?tag := ?IT, ?generation := ?GenId ?enc := Inner}, Now) ->
+classify_iterator(Shard, #{?tag := ?IT, ?generation := GenId, ?enc := Inner}, Now) ->
     case generation_get(Shard, GenId) of
         #{module := Mod, data := GenData} ->
-            Mod:classify_iterator(Shard, GenData, Inner, Now);
+            {ok, Mod:classify_iterator(Shard, GenData, Inner, Now)};
         not_found ->
             ?ERR_GEN_GONE
     end.

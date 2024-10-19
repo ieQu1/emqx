@@ -127,7 +127,9 @@
 -type return_addr(ItKey) :: {reference(), ItKey}.
 
 -record(poll_req, {
-    key,
+    stream,
+    topic_filter,
+    start_key,
     %% Node from which the poll request originates:
     node,
     %% Information about the process that created the request:
@@ -142,7 +144,9 @@
 
 -type poll_req(ItKey, Iterator) ::
     #poll_req{
-        key :: {_Stream, event_topic_filter(), emqx_ds:message_key()},
+        stream :: _Stream,
+        topic_filter :: event_topic_filter(),
+        start_key :: emqx_ds:message_key(),
         node :: node(),
         return_addr :: return_addr(ItKey),
         it :: Iterator,
@@ -179,10 +183,9 @@
     metrics_id,
     shard,
     name,
-    pending_queue :: ets:tid(),
+    old_queue :: ets:tid(),
     pending_request_limit :: non_neg_integer(),
     wait_queue :: ets:tid(),
-    is_spinning = false :: boolean(),
     batch_size :: non_neg_integer()
 }).
 
@@ -195,30 +198,11 @@
 -define(fulfill_loop, beamformer_fulfill_loop).
 -define(housekeeping_loop, housekeeping_loop).
 
-%% When beamformer receives a poll request it can fulfill it using
-%% three different strategies:
-%%
-%% 1. `future' iterators point to the tip of the stream. They will be
-%% fulfilled by new data. Poll requests for such iterators are sent to
-%% the waiting queue, where they stay put awaiting the event.
-%%
-%% 2. `fresh' iterators point to the existing data that is relatively
-%% fresh (as decided by the backend). For fresh iterators beamformer
-%% uses wildcard topic filter (bypassing any internal index lookup or
-%% filtering that backend may use to avoid) in hope that multiple
-%% in-sync consumers may reuse the DB query.
-%%
-%% 3. `old' iterators point to the exising data that was committed
-%% long time ago. Beamformer uses pessimistic strategy when fulfilling
-%% "old" poll requests. It doesn't try to agressively group old poll
-%% requests, and instead relies on the backend's internal filtering.
-%%
-%% Note: marking iterators as `fresh' is an optional optimization. The
-%% backend MAY only use `future' and `old' types.
-%%
-%% The backend MUST send shard events for all changes that happen
-%% after it reported matching iterator as `future'.
--type iterator_type() :: old | fresh | future.
+-type iterator_type() :: committed | committed_fresh | future.
+
+-type oldq_key() :: {_Stream, event_topic(), emqx_ds:message_key()}.
+
+%% -type freshq_key() :: {_Stream, emqx_ds:message_key()}.
 
 %%================================================================================
 %% Callbacks
@@ -243,12 +227,41 @@
 -callback scan_stream(_Shard, _Stream, _TopicFilter, _StartKey, _BatchSize :: non_neg_integer()) ->
     stream_scan_return().
 
-%% Once poll request is received by the beamformer, it asks the
-%% backend to classify it. This is not done in `unpack_iterator' to
-%% make sure iterators are classified as `future' (and sent to the
-%% waiting queue) _before_ event is received.
+%% Once poll request is received by the beamformer process, it asks
+%% the backend to classify it. Then beamformer will fulfill it using
+%% one of three different strategies:
 %%
-%% Note: called for every incoming poll request!
+%% 1. `future' iterators point beyond the tip of the stream. They will
+%% be fulfilled by new data. Poll requests for such iterators are sent
+%% to the waiting queue, where they stay put awaiting the event.
+%%
+%% 2. `committed_fresh' iterators point to the existing data that was
+%% written recently (as is decided by the backend). Beamformer assumes
+%% that _most_ of poll requests are concentrated near the tip of the
+%% stream and volume of "fresh" data is limited. As such, it tries to
+%% reuse fresh data aggressively: it scans the stream using wildcard
+%% topic filter (bypassing any backend-internal filtering based on
+%% topic filter) in hope that the data can be reused.
+%%
+%% 3. `committed' iterators point to the exising data that was written
+%% long time ago2. Beamformer uses pessimistic strategy when fulfilling
+%% "old" poll requests. It doesn't try to agressively reuse the data,
+%% and instead it relies on the backend's internal filtering.
+%%
+%% Note: marking iterators as `committed_fresh' is an optional
+%% optimization. The backend MAY only use `future' and `committed'
+%% types.
+%%
+%% The backend MUST send shard events for all changes that happen
+%% after it reported matching iterator as `future'.
+%%
+%% Note: this is a separate callback (and not part of
+%% `unpack_iterator') to avoid race condition when iterator is
+%% classified as `future' (and added to the waiting queue) and sending
+%% the event waking it up.
+%%
+%% Note: this callback is executed for every incoming poll request,
+%% possibly multiple times!
 -callback classify_iterator(_Shard, _Iterator) -> {ok, iterator_type()} | emqx_ds:error().
 
 %%================================================================================
@@ -281,7 +294,9 @@ poll(Node, ReturnAddr, Shard, Iterator, Opts = #{timeout := Timeout}) ->
             ),
             %% Make request:
             Req = #poll_req{
-                key = {Stream, TF, DSKey},
+                stream = Stream,
+                topic_filter = TF,
+                start_key = DSKey,
                 node = Node,
                 return_addr = ReturnAddr,
                 it = Iterator,
@@ -348,15 +363,13 @@ init([CBM, ShardId, Name, _Opts]) ->
     Pool = emqx_ds_beamformer_sup:pool(ShardId),
     gproc_pool:add_worker(Pool, Name),
     gproc_pool:connect_worker(Pool, Name),
-    PendingTab = ets:new(pending_polls, [duplicate_bag, private, {keypos, #poll_req.key}]),
-    WaitingTab = emqx_ds_beamformer_waitq:new(),
     S = #s{
         module = CBM,
         shard = ShardId,
         metrics_id = shard_metrics_id(ShardId),
         name = Name,
-        pending_queue = PendingTab,
-        wait_queue = WaitingTab,
+        old_queue = oldq_new(),
+        wait_queue = emqx_ds_beamformer_waitq:new(),
         pending_request_limit = cfg_pending_request_limit(),
         batch_size = cfg_batch_size()
     },
@@ -366,11 +379,11 @@ init([CBM, ShardId, Name, _Opts]) ->
 handle_call(
     Req = #poll_req{},
     _From,
-    S0 = #s{pending_queue = PendingTab, wait_queue = WaitingTab, metrics_id = Metrics}
+    S0 = #s{old_queue = OldQueue, wait_queue = WaitingTab, metrics_id = Metrics}
 ) ->
     %% FIXME
     %% this is a potentially costly operation
-    PQLen = ets:info(PendingTab, size),
+    PQLen = ets:info(OldQueue, size),
     WQLen = ets:info(WaitingTab, size),
     emqx_ds_builtin_metrics:set_pendingq_len(Metrics, PQLen),
     emqx_ds_builtin_metrics:set_waitq_len(Metrics, WQLen),
@@ -387,8 +400,8 @@ handle_call(_Call, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
 enqueue(
-    Req = #poll_req{key = {Stream, TopicFilter, Key}, it = It0, return_addr = Id},
-    S = #s{pending_queue = PendingTab, wait_queue = WaitingTab, module = CBM, shard = ShardId}
+    Req = #poll_req{stream = Stream, topic_filter = TopicFilter, it = It0, return_addr = Id},
+    S = #s{old_queue = OldQ, wait_queue = WaitingTab, module = CBM, shard = ShardId}
 ) ->
     %% Check if the request belongs to committed range:
     case CBM:classify_iterator(ShardId, It0) of
@@ -398,7 +411,7 @@ enqueue(
             {ok, S};
         _ ->
             %% logger:warning("enqueue p~p~n  ~p", [HighWM, Req]),
-            ets:insert(PendingTab, Req),
+            oldq_push(OldQ, Req),
             ensure_fulfill_loop(),
             {ok, S}
     end.
@@ -466,8 +479,8 @@ ensure_fulfill_loop() ->
     end.
 
 -spec cleanup(s()) -> s().
-cleanup(S = #s{pending_queue = PendingTab, wait_queue = WaitingTab, metrics_id = Metrics}) ->
-    do_cleanup(Metrics, PendingTab),
+cleanup(S = #s{old_queue = OldQueue, wait_queue = WaitingTab, metrics_id = Metrics}) ->
+    do_cleanup(Metrics, OldQueue),
     do_cleanup(Metrics, WaitingTab),
     S.
 
@@ -478,9 +491,9 @@ do_cleanup(Metrics, Tab) ->
     emqx_ds_builtin_metrics:inc_poll_requests_expired(Metrics, NDeleted).
 
 -spec fulfill_pending(s()) -> s().
-fulfill_pending(S = #s{pending_queue = PendingTab}) ->
+fulfill_pending(S = #s{old_queue = OldQueue}) ->
     %% debug_pending(S),
-    case find_pending(PendingTab, 100) of
+    case oldq_find_oldest(OldQueue, 100) of
         undefined ->
             S;
         {Stream, TopicFilter, StartKey} ->
@@ -496,7 +509,7 @@ do_fulfill_pending(
     S = #s{
         shard = Shard,
         module = CBM,
-        pending_queue = PendingTab,
+        old_queue = OldQueue,
         batch_size = BatchSize
     },
     Stream, TopicFilter, StartKey
@@ -504,9 +517,7 @@ do_fulfill_pending(
     OnMatch = fun(_) -> ok end,
     %% Here we only group requests with exact match of the topic
     %% filter:
-    GetF = fun(MsgKey) ->
-        ets:take(PendingTab, {Stream, TopicFilter, MsgKey})
-    end,
+    GetF = oldq_pop(OldQueue, Stream, TopicFilter),
     Result = CBM:scan_stream(Shard, Stream, TopicFilter, StartKey, BatchSize),
     form_beams(S, GetF, OnMatch, move_to_waiting(S), StartKey, Result).
 
@@ -533,8 +544,8 @@ maybe_fulfill_waiting(
             OnNomatch = fun(_) -> ok end,
             OnMatch = fun(Reqs) ->
                 lists:foreach(
-                    fun(#poll_req{key = {Str, TF, _}, return_addr = Id}) ->
-                        emqx_ds_beamformer_waitq:delete(Str, TF, Id, WaitingTab)
+                    fun(#poll_req{stream = Str, topic_filter = TF, return_addr = Id}) ->
+                            emqx_ds_beamformer_waitq:delete(Str, TF, Id, WaitingTab)
                     end,
                     Reqs
                 )
@@ -549,7 +560,7 @@ maybe_fulfill_waiting(
 move_to_waiting(#s{wait_queue = WaitingTab}) ->
     fun(NoMatch) ->
         lists:foreach(
-            fun(Req = #poll_req{key = {Stream, TopicFilter, _Key}, return_addr = Id}) ->
+            fun(Req = #poll_req{stream = Stream, topic_filter = TopicFilter, return_addr = Id}) ->
                 emqx_ds_beamformer_waitq:insert(Stream, TopicFilter, Id, Req, WaitingTab)
             end,
             NoMatch
@@ -569,21 +580,17 @@ find_waiting(Stream, Topic, Tab) ->
             %% 3. Find the smallest DS key
             lists:foldl(
                 fun(Req, {Acc, AccTopic, AccKey}) ->
-                    ReqKey = ds_key_of_poll(Req),
+                    #poll_req{topic_filter = TF, start_key = StartKey} = Req,
                     {
-                        map_pushl(ReqKey, Req, Acc),
-                        common_topic_filter(AccTopic, topic_of_poll(Req)),
-                        min(AccKey, ReqKey)
+                        map_pushl(StartKey, Req, Acc),
+                        common_topic_filter(AccTopic, TF),
+                        min(AccKey, StartKey)
                     }
                 end,
-                {#{}, topic_of_poll(Fst), ds_key_of_poll(Fst)},
+                {#{}, Fst#poll_req.topic_filter, Fst#poll_req.start_key},
                 Matches
             )
     end.
-
-ds_key_of_poll(#poll_req{key = {_, _, Key}}) -> Key.
-
-topic_of_poll(#poll_req{key = {_, Topic, _}}) -> Topic.
 
 common_topic_filter([], []) ->
     [];
@@ -600,34 +607,6 @@ common_topic_filter([A | L1], [A | L2]) ->
 
 map_pushl(Key, Elem, Map) ->
     maps:update_with(Key, fun(L) -> [Elem | L] end, [Elem], Map).
-
-%% It's always worth trying to fulfill the oldest requests first,
-%% because they have a better chance of producing a batch that
-%% overlaps with other pending requests.
-%%
-%% This function implements a heuristic that tries to find such poll
-%% request. It simply compares the keys (and nothing else) within a
-%% small sample of pending polls, and picks request with the smallest
-%% key as the starting point.
-find_pending(Tab, SampleSize) ->
-    MS = {'_', [], ['$_']},
-    case ets:select(Tab, [MS], SampleSize) of
-        '$end_of_table' ->
-            undefined;
-        {[Fst | Rest], _Cont} ->
-            %% Find poll request with the minimal key:
-            Oldest = lists:foldl(
-                fun(E, Acc) ->
-                    case ds_key_of_poll(E) < ds_key_of_poll(Acc) of
-                        true -> E;
-                        false -> Acc
-                    end
-                end,
-                Fst,
-                Rest
-            ),
-            Oldest#poll_req.key
-    end.
 
 %% @doc Split beam into individual batches
 -spec split(beam(ItKey, Iterator)) -> [{ItKey, emqx_ds:next_result(Iterator)}].
@@ -831,6 +810,47 @@ send_out(Node, Beam) ->
 
 shard_metrics_id({DB, Shard}) ->
     emqx_ds_builtin_metrics:shard_metric_id(DB, Shard).
+
+%%%%%% Old queue:
+
+oldq_new() ->
+    ets:new(pending_polls, [duplicate_bag, private, {keypos, 1}]).
+
+oldq_push(OldQueue, Req = #poll_req{stream = S, topic_filter = TF, start_key = Key}) ->
+    ets:insert(OldQueue, {{S, TF, Key}, Req}).
+
+oldq_pop(OldQueue, Stream, TopicFilter) ->
+    fun(MsgKey) ->
+            [Req || {_, Req} <- ets:take(OldQueue, {Stream, TopicFilter, MsgKey})]
+    end.
+
+%% It's always worth trying to fulfill the oldest requests first,
+%% because they have a better chance of producing a batch that
+%% overlaps with other pending requests.
+%%
+%% This function implements a heuristic that tries to find such poll
+%% request. It simply compares the keys (and nothing else) within a
+%% small sample of pending polls, and picks request with the smallest
+%% key as the starting point.
+-spec oldq_find_oldest(ets:tid(), pos_integer()) -> oldq_key().
+oldq_find_oldest(Tab, SampleSize) ->
+    MS = {{'$1', '_'}, [], ['$1']},
+    case ets:select(Tab, [MS], SampleSize) of
+        '$end_of_table' ->
+            undefined;
+        {[Fst | Rest], _Cont} ->
+            %% Find poll request key with the minimum start_key:
+            lists:foldl(
+                fun(E, Acc) ->
+                    case element(3, E) < element(3, Acc) of
+                        true -> E;
+                        false -> Acc
+                    end
+                end,
+                Fst,
+                Rest
+            )
+    end.
 
 %% Dynamic config (currently it's global for all DBs):
 
