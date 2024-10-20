@@ -59,6 +59,7 @@
 -endif.
 
 -elvis([{elvis_style, nesting_level, disable}]).
+-elvis([{elvis_style, no_if_expression, disable}]).
 
 %%================================================================================
 %% Type declarations
@@ -200,34 +201,30 @@ drop(_ShardId, DBHandle, _GenId, _CFRefs, #s{data_cf = DataCF, trie_cf = TrieCF,
     ok = rocksdb:drop_column_family(DBHandle, TrieCF),
     ok.
 
-prepare_batch(
-    _ShardId,
-    S = #s{trie = Trie, threshold_fun = TFun},
-    Operations,
-    _Options
-) ->
+prepare_batch(_ShardId, S, Operations, _Options) ->
     _ = erase(?lts_persist_ops),
-    OperationsCooked = emqx_utils:flattermap(
-        fun
-            ({Timestamp, Msg = #message{topic = Topic}}) ->
-                Tokens = words(Topic),
-                {Static, Varying} = emqx_ds_lts:topic_key(Trie, TFun, Tokens),
-                ?cooked_msg_op(Timestamp, Static, Varying, serialize(S, Varying, Msg));
-            ({delete, #message_matcher{topic = Topic, timestamp = Timestamp}}) ->
-                case emqx_ds_lts:lookup_topic_key(Trie, words(Topic)) of
-                    {ok, {Static, Varying}} ->
-                        ?cooked_msg_op(Timestamp, Static, Varying, ?cooked_delete);
-                    undefined ->
-                        %% Topic is unknown, nothing to delete.
-                        []
-                end
-        end,
-        Operations
-    ),
+    OperationsCooked = cook(S, Operations, []),
     {ok, #{
         ?cooked_msg_ops => OperationsCooked,
         ?cooked_lts_ops => pop_lts_persist_ops()
     }}.
+
+cook(_, [], Acc) ->
+    lists:reverse(Acc);
+cook(S, [{Timestamp, Msg = #message{topic = Topic}} | Rest], Acc) ->
+    #s{trie = Trie, threshold_fun = TFun} = S,
+    Tokens = words(Topic),
+    {Static, Varying} = emqx_ds_lts:topic_key(Trie, TFun, Tokens),
+    cook(S, Rest, [?cooked_msg_op(Timestamp, Static, Varying, serialize(S, Varying, Msg)) | Acc]);
+cook(S, [{delete, #message_matcher{topic = Topic, timestamp = Timestamp}} | Rest], Acc) ->
+    #s{trie = Trie} = S,
+    case emqx_ds_lts:lookup_topic_key(Trie, words(Topic)) of
+        {ok, {Static, Varying}} ->
+            cook(S, Rest, [?cooked_msg_op(Timestamp, Static, Varying, ?cooked_delete) | Acc]);
+        undefined ->
+            %% Topic is unknown, nothing to delete.
+            cook(S, Rest, Acc)
+    end.
 
 commit_batch(
     _ShardId,
@@ -359,9 +356,10 @@ scan_stream(Shard, S, StaticIdx, Varying, LastSeenKey, BatchSize, TMax, IsCurren
     end.
 
 classify_iterator(_Shard, _S, #it{ts = TS}, Now) ->
-    case TS >= Now of
-        true -> future;
-        false -> committed
+    DT = Now - TS,
+    if DT =< 0 -> future;
+       DT < 1_000_000 -> committed_fresh;
+       true -> committed
     end.
 
 make_delete_iterator(Shard, Data, Stream, TopicFilter, StartTime) ->

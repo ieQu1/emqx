@@ -184,8 +184,9 @@
     shard,
     name,
     old_queue :: ets:tid(),
-    pending_request_limit :: non_neg_integer(),
+    fresh_queue :: ets:tid(),
     wait_queue :: ets:tid(),
+    pending_request_limit :: non_neg_integer(),
     batch_size :: non_neg_integer()
 }).
 
@@ -369,6 +370,7 @@ init([CBM, ShardId, Name, _Opts]) ->
         metrics_id = shard_metrics_id(ShardId),
         name = Name,
         old_queue = oldq_new(),
+        fresh_queue = freshq_new(),
         wait_queue = emqx_ds_beamformer_waitq:new(),
         pending_request_limit = cfg_pending_request_limit(),
         batch_size = cfg_batch_size()
@@ -379,11 +381,11 @@ init([CBM, ShardId, Name, _Opts]) ->
 handle_call(
     Req = #poll_req{},
     _From,
-    S0 = #s{old_queue = OldQueue, wait_queue = WaitingTab, metrics_id = Metrics}
+    S0 = #s{old_queue = OldQueue, fresh_queue = FreshQueue, wait_queue = WaitingTab, metrics_id = Metrics}
 ) ->
     %% FIXME
     %% this is a potentially costly operation
-    PQLen = ets:info(OldQueue, size),
+    PQLen = ets:info(OldQueue, size) + ets:info(FreshQueue, size),
     WQLen = ets:info(WaitingTab, size),
     emqx_ds_builtin_metrics:set_pendingq_len(Metrics, PQLen),
     emqx_ds_builtin_metrics:set_waitq_len(Metrics, WQLen),
@@ -400,17 +402,18 @@ handle_call(_Call, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
 enqueue(
-    Req = #poll_req{stream = Stream, topic_filter = TopicFilter, it = It0, return_addr = Id},
-    S = #s{old_queue = OldQ, wait_queue = WaitingTab, module = CBM, shard = ShardId}
+    Req = #poll_req{stream = Stream, topic_filter = TopicFilter, it = It, return_addr = Id},
+    S = #s{old_queue = OldQ, fresh_queue = FreshQ, wait_queue = WaitingTab, module = CBM, shard = ShardId}
 ) ->
-    %% Check if the request belongs to committed range:
-    case CBM:classify_iterator(ShardId, It0) of
-        future ->
-            %% logger:warning("enqueue w~p~n  ~p", [HighWM, Req]),
+    case CBM:classify_iterator(ShardId, It) of
+        {ok, future} ->
             emqx_ds_beamformer_waitq:insert(Stream, TopicFilter, Id, Req, WaitingTab),
             {ok, S};
-        _ ->
-            %% logger:warning("enqueue p~p~n  ~p", [HighWM, Req]),
+        {ok, committed_fresh} ->
+            freshq_push(FreshQ, Req),
+            ensure_fulfill_loop(),
+            {ok, S};
+        {ok, committed} ->
             oldq_push(OldQ, Req),
             ensure_fulfill_loop(),
             {ok, S}
@@ -424,7 +427,8 @@ handle_info(#shard_event{events = Events}, S) ->
     {noreply, maybe_fulfill_waiting(S, Events)};
 handle_info(?fulfill_loop, S0) ->
     put(?fulfill_loop, false),
-    S = fulfill_pending(S0),
+    S1 = fulfill_fresh(S0),
+    S = fulfill_old(S1),
     {noreply, S};
 handle_info(?housekeeping_loop, S0) ->
     %% Reload configuration according from environment variables:
@@ -479,33 +483,111 @@ ensure_fulfill_loop() ->
     end.
 
 -spec cleanup(s()) -> s().
-cleanup(S = #s{old_queue = OldQueue, wait_queue = WaitingTab, metrics_id = Metrics}) ->
-    do_cleanup(Metrics, OldQueue),
-    do_cleanup(Metrics, WaitingTab),
+cleanup(S = #s{old_queue = OldQ, fresh_queue = FreshQ, wait_queue = WaitQ, metrics_id = Metrics}) ->
+    do_cleanup(Metrics, OldQ),
+    do_cleanup(Metrics, FreshQ),
+    do_cleanup(Metrics, WaitQ),
     S.
 
 do_cleanup(Metrics, Tab) ->
     Now = erlang:monotonic_time(millisecond),
-    MS = {#poll_req{_ = '_', deadline = '$1'}, [{'<', '$1', Now}], [true]},
+    MS = {{'_', #poll_req{_ = '_', deadline = '$1'}}, [{'<', '$1', Now}], [true]},
     NDeleted = ets:select_delete(Tab, [MS]),
     emqx_ds_builtin_metrics:inc_poll_requests_expired(Metrics, NDeleted).
 
--spec fulfill_pending(s()) -> s().
-fulfill_pending(S = #s{old_queue = OldQueue}) ->
+%%%%%% Fresh queue
+
+-spec fulfill_fresh(s()) -> s().
+fulfill_fresh(S = #s{fresh_queue = FreshQueue}) ->
     %% debug_pending(S),
-    case oldq_find_oldest(OldQueue, 100) of
+    case freshq_find_oldest(FreshQueue) of
         undefined ->
             S;
-        {Stream, TopicFilter, StartKey} ->
-            ?tp(emqx_ds_beamformer_fulfill_pending, #{stream => Stream, topic => TopicFilter, start_key => StartKey}),
+        PolLReq ->
+            ?tp(emqx_ds_beamformer_fulfill_fresh, #{stream => Stream, start_key => StartKey}),
             %% The function MUST destructively consume all requests
             %% matching stream and MsgKey to avoid infinite loop:
-            do_fulfill_pending(S, Stream, TopicFilter, StartKey),
+            do_fulfill_fresh(S, PolLReq),
             ensure_fulfill_loop(),
             S
     end.
 
-do_fulfill_pending(
+do_fulfill_fresh(
+    S = #s{
+        shard = Shard,
+        module = CBM,
+        fresh_queue = FreshQueue,
+        batch_size = BatchSize
+    },
+    #poll_req{stream = Stream, start_key = StartKey, topic_filter = TF0}
+) ->
+    %% FIXME: handle '#'
+    TopicFilter = ['+' || _ <- TF0],
+    OnMatch = fun(_) -> ok end,
+    GetF = freshq_pop(FreshQueue, Stream),
+    Result = CBM:scan_stream(Shard, Stream, TopicFilter, StartKey, BatchSize),
+    form_beams(S, GetF, OnMatch, enqueue_nomatch(S), StartKey, Result).
+
+freshq_new() ->
+    ets:new(fresh_polls, [ordered_set, private, {keypos, 1}]).
+
+freshq_push(FreshQueue, Req = #poll_req{stream = Stream, start_key = Key, return_addr = RAddr}) ->
+    ets:insert(FreshQueue, {{Stream, Key, RAddr}, Req}).
+
+freshq_find_oldest(Tab) ->
+    %% FIXME: this is clearly biased for certain streams
+    case ets:first(Tab) of
+        K = {_, _, _} ->
+            [{_, PollReq}] = ets:lookup(Tab, K),
+            PollReq;
+        '$end_of_table' ->
+            undefined
+    end.
+
+freshq_find_oldest(Tab, Stream) ->
+    case ets:next(Tab, {Stream, 0, 0}) of
+        K = {Stream, _, _} ->
+            [{_, PollReq}] = ets:lookup(Tab, K),
+            PollReq;
+        {_, _, _} ->
+            undefined;
+        '$end_of_table' ->
+            undefined
+    end.
+
+freshq_pop(Tab, Stream) ->
+    fun(MsgKey) ->
+            do_pop_fresh(Tab, Stream, MsgKey, {Stream, MsgKey, 0}, [])
+    end.
+
+do_pop_fresh(Tab, Stream, MsgKey, Prev, Acc0) ->
+    case ets:next(Tab, Prev) of
+        K = {Stream, MsgKey, _} ->
+            {_, Req} = ets:take(Tab, K),
+            do_pop(Tab, Stream, MsgKey, K, [Elem | Acc]);
+        {_, _, _} ->
+            Acc0;
+        '$end_of_table' ->
+            Acc0
+    end.
+
+%%%%%% Old queue
+
+fulfill_old(S = #s{old_queue = OldQueue}) ->
+    %% debug_pending(S),
+    case queue_find_oldest(3, OldQueue, 100) of
+        undefined ->
+            S;
+        {Stream, TopicFilter, StartKey} ->
+            ?tp(emqx_ds_beamformer_fulfill_old, #{stream => Stream, topic => TopicFilter, start_key => StartKey}),
+            %% The function MUST destructively consume all requests
+            %% matching stream and MsgKey to avoid infinite loop:
+            do_fulfill_old(S, Stream, TopicFilter, StartKey),
+            ensure_fulfill_loop(),
+            S
+    end.
+
+do_fulfill_old(
     S = #s{
         shard = Shard,
         module = CBM,
@@ -519,7 +601,20 @@ do_fulfill_pending(
     %% filter:
     GetF = oldq_pop(OldQueue, Stream, TopicFilter),
     Result = CBM:scan_stream(Shard, Stream, TopicFilter, StartKey, BatchSize),
-    form_beams(S, GetF, OnMatch, move_to_waiting(S), StartKey, Result).
+    form_beams(S, GetF, OnMatch, enqueue_nomatch(S), StartKey, Result).
+
+oldq_new() ->
+    ets:new(old_polls, [duplicate_bag, private, {keypos, 1}]).
+
+oldq_push(OldQueue, Req = #poll_req{stream = Stream, topic_filter = TF, start_key = Key}) ->
+    ets:insert(OldQueue, {{Stream, TF, Key}, Req}).
+
+oldq_pop(OldQueue, Stream, TopicFilter) ->
+    fun(MsgKey) ->
+            [Req || {_, Req} <- ets:take(OldQueue, {Stream, TopicFilter, MsgKey})]
+    end.
+
+%%%%% Waiting queue
 
 maybe_fulfill_waiting(S, []) ->
     S;
@@ -541,7 +636,7 @@ maybe_fulfill_waiting(
                 start_time => StartKey
             }),
             GetF = fun(Key) -> maps:get(Key, Candidates, []) end,
-            OnNomatch = fun(_) -> ok end,
+            OnNomatch = fun(_, _) -> ok end,
             OnMatch = fun(Reqs) ->
                 lists:foreach(
                     fun(#poll_req{stream = Str, topic_filter = TF, return_addr = Id}) ->
@@ -557,15 +652,31 @@ maybe_fulfill_waiting(
             end
     end.
 
-move_to_waiting(#s{wait_queue = WaitingTab}) ->
-    fun(NoMatch) ->
-        lists:foreach(
+enqueue_nomatch(#s{wait_queue = WaitingTab}) ->
+    fun(_EndKey, NoMatch) ->
+         lists:foreach(
             fun(Req = #poll_req{stream = Stream, topic_filter = TopicFilter, return_addr = Id}) ->
-                emqx_ds_beamformer_waitq:insert(Stream, TopicFilter, Id, Req, WaitingTab)
+                  emqx_ds_beamformer_waitq:insert(Stream, TopicFilter, Id, Req, WaitingTab)
             end,
-            NoMatch
-        )
+           NoMatch)
     end.
+
+%% enqueue_nomatch(S = #s{module = CBM, shard = Shard}) ->
+%%     fun(EndKey, NoMatch) ->
+%%         lists:foreach(
+%%             fun(Req0 = #poll_req{it = It0}) ->
+%%                 case CBM:update_iterator(Shard, It0, EndKey) of
+%%                     {ok, It} ->
+%%                         Req = Req0#poll_req{start_key = EndKey, it = It},
+%%                         enqueue(Req, S);
+%%                     {error, _, _} ->
+%%                         ok
+%%                 end
+%%             end,
+%%             NoMatch
+%%         )
+%%     end.
+
 
 find_waiting(Stream, Topic, Tab) ->
     case emqx_ds_beamformer_waitq:matches(Stream, Topic, Tab) of
@@ -688,6 +799,7 @@ do_form_beams(
     %% Find iterators that match the start message of the batch (to
     %% handle iterators freshly created by `emqx_ds:make_iterator'):
     Candidates0 = GetF(StartKey),
+    %% logger:warning("candidates ~p ~p ~p", [StartKey, length(Candidates0), length(Batch)]),
     %% Search for iterators where `last_seen_key' is equal to key of
     %% any message in the batch:
     Candidates = lists:foldl(
@@ -711,7 +823,7 @@ do_form_beams(
         end,
     %% Execute callbacks:
     OnMatch(MatchReqs),
-    OnNomatch(NoMatchReqs),
+    OnNomatch(EndKey, NoMatchReqs),
     %% Split matched requests by destination node:
     ReqsByNode = maps:groups_from_list(fun(#poll_req{node = Node}) -> Node end, MatchReqs),
     %% Pack requests into beams and serve them:
@@ -734,7 +846,7 @@ do_form_beams(
     [{emqx_ds:message_key(), emqx_types:message()}]
 ) -> beam(ItKey, Iterator).
 pack(UpdateIterator, NextKey, Reqs, Batch) ->
-    Pack = [{Key, mk_mask(Reqs, Elem), Msg} || Elem = {Key, Msg} <- Batch],
+    Pack = do_pack(Reqs, Batch, []),
     UpdatedIterators =
         lists:map(
             fun(#poll_req{it = It0, return_addr = RAddr}) ->
@@ -747,6 +859,15 @@ pack(UpdateIterator, NextKey, Reqs, Batch) ->
         iterators = UpdatedIterators,
         pack = Pack
     }.
+
+do_pack(_Reqs, [], Acc) ->
+    lists:reverse(Acc);
+do_pack(Reqs, [Elem = {Key, Msg} | Rest], Acc0) ->
+    Acc = case mk_mask(Reqs, Elem) of
+              {true, DispatchMask} -> [{Key, DispatchMask, Msg} | Acc0];
+              {false, _} -> Acc0
+          end,
+    do_pack(Reqs, Rest, Acc).
 
 split([], _Pack, _N, Acc) ->
     Acc;
@@ -771,17 +892,23 @@ is_member(N, Mask) ->
 -spec mk_mask([poll_req(_ItKey, _Iterator)], {emqx_ds:message_key(), emqx_types:message()}) ->
     dispatch_mask().
 mk_mask(Reqs, Elem) ->
-    mk_mask(Reqs, Elem, <<>>).
+    mk_mask(Reqs, Elem, <<>>, false).
 
-mk_mask([], _Elem, Acc) ->
-    Acc;
-mk_mask([#poll_req{msg_matcher = Matcher} | Rest], {Key, Message} = Elem, Acc) ->
+mk_mask([], _Elem, Acc, AnyMatch) ->
+    {AnyMatch, Acc};
+mk_mask([#poll_req{msg_matcher = Matcher} | Rest], {Key, Message} = Elem, Acc, AnyMatch) ->
+    Match = Matcher(Key, Message),
     Val =
-        case Matcher(Key, Message) of
+        case Match of
             true -> 1;
             false -> 0
         end,
-    mk_mask(Rest, Elem, <<Acc/bitstring, Val:1>>).
+    mk_mask(
+      Rest,
+      Elem,
+      <<Acc/bitstring, Val:1>>,
+      AnyMatch or Match
+     ).
 
 filter_candidates(Reqs, Messages) ->
     lists:partition(
@@ -811,18 +938,9 @@ send_out(Node, Beam) ->
 shard_metrics_id({DB, Shard}) ->
     emqx_ds_builtin_metrics:shard_metric_id(DB, Shard).
 
-%%%%%% Old queue:
+%%%%%% Fresh queue:
 
-oldq_new() ->
-    ets:new(pending_polls, [duplicate_bag, private, {keypos, 1}]).
-
-oldq_push(OldQueue, Req = #poll_req{stream = S, topic_filter = TF, start_key = Key}) ->
-    ets:insert(OldQueue, {{S, TF, Key}, Req}).
-
-oldq_pop(OldQueue, Stream, TopicFilter) ->
-    fun(MsgKey) ->
-            [Req || {_, Req} <- ets:take(OldQueue, {Stream, TopicFilter, MsgKey})]
-    end.
+%%%%%% Generic queue functions:
 
 %% It's always worth trying to fulfill the oldest requests first,
 %% because they have a better chance of producing a batch that
@@ -832,8 +950,8 @@ oldq_pop(OldQueue, Stream, TopicFilter) ->
 %% request. It simply compares the keys (and nothing else) within a
 %% small sample of pending polls, and picks request with the smallest
 %% key as the starting point.
--spec oldq_find_oldest(ets:tid(), pos_integer()) -> oldq_key().
-oldq_find_oldest(Tab, SampleSize) ->
+-spec queue_find_oldest(pos_integer(), ets:tid(), pos_integer()) -> oldq_key().
+queue_find_oldest(Elem, Tab, SampleSize) ->
     MS = {{'$1', '_'}, [], ['$1']},
     case ets:select(Tab, [MS], SampleSize) of
         '$end_of_table' ->
@@ -842,7 +960,7 @@ oldq_find_oldest(Tab, SampleSize) ->
             %% Find poll request key with the minimum start_key:
             lists:foldl(
                 fun(E, Acc) ->
-                    case element(3, E) < element(3, Acc) of
+                    case element(Elem, E) < element(Elem, Acc) of
                         true -> E;
                         false -> Acc
                     end
