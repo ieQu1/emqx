@@ -209,7 +209,7 @@
 %% Callbacks
 %%================================================================================
 
--type match_messagef() :: fun((emqx_ds:message_key(), emqx_types:message()) -> boolean()).
+-type match_messagef() :: fun((emqx_ds:message_key(), emqx_ds:topic(), emqx_types:message()) -> boolean()).
 
 -type unpack_iterator_result(Stream) :: #{
     stream := Stream,
@@ -371,7 +371,7 @@ init([CBM, ShardId, Name, _Opts]) ->
         name = Name,
         old_queue = oldq_new(),
         fresh_queue = freshq_new(),
-        wait_queue = emqx_ds_beamformer_waitq:new(),
+        wait_queue = freshq_new(),
         pending_request_limit = cfg_pending_request_limit(),
         batch_size = cfg_batch_size()
     },
@@ -402,18 +402,18 @@ handle_call(_Call, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
 enqueue(
-    Req = #poll_req{stream = Stream, topic_filter = TopicFilter, it = It, return_addr = Id},
-    S = #s{old_queue = OldQ, fresh_queue = FreshQ, wait_queue = WaitingTab, module = CBM, shard = ShardId}
+    Req = #poll_req{it = It},
+    S = #s{old_queue = OldQ, fresh_queue = _FreshQ, wait_queue = WaitQ, module = CBM, shard = ShardId}
 ) ->
     case CBM:classify_iterator(ShardId, It) of
         {ok, future} ->
-            emqx_ds_beamformer_waitq:insert(Stream, TopicFilter, Id, Req, WaitingTab),
+            freshq_push(WaitQ, Req),
             {ok, S};
-        {ok, committed_fresh} ->
-            freshq_push(FreshQ, Req),
-            ensure_fulfill_loop(),
-            {ok, S};
-        {ok, committed} ->
+        %% {ok, committed_fresh} ->
+        %%     freshq_push(FreshQ, Req),
+        %%     ensure_fulfill_loop(),
+        %%     {ok, S};
+        {ok, _} ->
             oldq_push(OldQ, Req),
             ensure_fulfill_loop(),
             {ok, S}
@@ -424,7 +424,7 @@ handle_cast(_Cast, S) ->
 
 handle_info(#shard_event{events = Events}, S) ->
     ?tp(debug, emqx_ds_beamformer_event, #{events => Events}),
-    {noreply, maybe_fulfill_waiting(S, Events)};
+    {noreply, maybe_fulfill_waiting(S, group_events(Events))};
 handle_info(?fulfill_loop, S0) ->
     put(?fulfill_loop, false),
     S1 = fulfill_fresh(S0),
@@ -447,6 +447,17 @@ terminate(_Reason, #s{shard = ShardId, name = Name}) ->
     gproc_pool:disconnect_worker(Pool, Name),
     gproc_pool:remove_worker(Pool, Name),
     ok.
+
+group_events(Events) ->
+    maps:keys(
+    lists:foldl(
+      fun({Stream, TF0}, Acc) ->
+              %% FIXME: handle '#'
+              TF = ['+' || _ <- TF0],
+              maps:put({Stream, TF}, [], Acc)
+      end,
+      #{},
+      Events)).
 
 %%================================================================================
 %% Internal exports
@@ -503,11 +514,11 @@ fulfill_fresh(S = #s{fresh_queue = FreshQueue}) ->
     case freshq_find_oldest(FreshQueue) of
         undefined ->
             S;
-        PolLReq ->
+        Req = #poll_req{stream = Stream, start_key = StartKey} ->
             ?tp(emqx_ds_beamformer_fulfill_fresh, #{stream => Stream, start_key => StartKey}),
             %% The function MUST destructively consume all requests
             %% matching stream and MsgKey to avoid infinite loop:
-            do_fulfill_fresh(S, PolLReq),
+            do_fulfill_fresh(S, Req),
             ensure_fulfill_loop(),
             S
     end.
@@ -544,15 +555,18 @@ freshq_find_oldest(Tab) ->
             undefined
     end.
 
-freshq_find_oldest(Tab, Stream) ->
-    case ets:next(Tab, {Stream, 0, 0}) of
-        K = {Stream, _, _} ->
-            [{_, PollReq}] = ets:lookup(Tab, K),
-            PollReq;
+freshq_lookup(Tab, Stream, StartKey) ->
+    freshq_lookup(Tab, Stream, StartKey, {Stream, StartKey, 0}, []).
+
+freshq_lookup(Tab, Stream, StartKey, Prev, Acc) ->
+    case ets:next(Tab, Prev) of
+        K = {Stream, SK, _} when SK >= StartKey ->
+            Req = ets:lookup_element(Tab, K, 2),
+            freshq_lookup(Tab, Stream, StartKey, K, [Req | Acc]);
         {_, _, _} ->
-            undefined;
+            Acc;
         '$end_of_table' ->
-            undefined
+            Acc
     end.
 
 freshq_pop(Tab, Stream) ->
@@ -560,15 +574,15 @@ freshq_pop(Tab, Stream) ->
             do_pop_fresh(Tab, Stream, MsgKey, {Stream, MsgKey, 0}, [])
     end.
 
-do_pop_fresh(Tab, Stream, MsgKey, Prev, Acc0) ->
+do_pop_fresh(Tab, Stream, MsgKey, Prev, Acc) ->
     case ets:next(Tab, Prev) of
         K = {Stream, MsgKey, _} ->
-            {_, Req} = ets:take(Tab, K),
-            do_pop(Tab, Stream, MsgKey, K, [Elem | Acc]);
+            [{_, Req}] = ets:take(Tab, K),
+            do_pop_fresh(Tab, Stream, MsgKey, K, [Req | Acc]);
         {_, _, _} ->
-            Acc0;
+            Acc;
         '$end_of_table' ->
-            Acc0
+            Acc
     end.
 
 %%%%%% Old queue
@@ -618,106 +632,85 @@ oldq_pop(OldQueue, Stream, TopicFilter) ->
 
 maybe_fulfill_waiting(S, []) ->
     S;
+maybe_fulfill_waiting(S0, [{Stream, UpdatedTopic} | Rest]) ->
+    S = maybe_fulfill_waiting(S0, Stream, UpdatedTopic, {Stream, 0, 0}),
+    maybe_fulfill_waiting(S, Rest).
+
 maybe_fulfill_waiting(
-    S = #s{wait_queue = WaitingTab, module = CBM, shard = Shard, batch_size = BatchSize},
-    [{Stream, UpdatedTopic} | Rest]
+    S = #s{wait_queue = WaitQ, module = CBM, shard = Shard, batch_size = BatchSize},
+    Stream,
+    UpdatedTopic,
+    PrevKey
 ) ->
-    case find_waiting(Stream, UpdatedTopic, WaitingTab) of
-        undefined ->
-            ?tp(emqx_ds_beamformer_fulfill_waiting, #{
-                stream => Stream, topic => UpdatedTopic, candidates => undefined
-            }),
-            maybe_fulfill_waiting(S, Rest);
-        {Candidates, TopicFilter, StartKey} ->
-            ?tp(emqx_ds_beamformer_fulfill_waiting, #{
+    case ets:next(WaitQ, PrevKey) of
+        NextKey = {Stream, StartKey, _} ->
+            ?tp(debug, emqx_ds_beamformer_fulfill_waiting, #{
                 stream => Stream,
                 topic => UpdatedTopic,
-                candidates => Candidates,
-                start_time => StartKey
+                start_key => StartKey
             }),
-            GetF = fun(Key) -> maps:get(Key, Candidates, []) end,
-            OnNomatch = fun(_, _) -> ok end,
+            GetF = fun(Key) ->
+                           Res = freshq_lookup(WaitQ, Stream, Key),
+                           %% ?tp(warning, waitq_lookup, #{stream => Stream, key => Key, res => Res}),
+                           Res
+                   end,
+            OnNomatch = enqueue_nomatch(S),
             OnMatch = fun(Reqs) ->
                 lists:foreach(
-                    fun(#poll_req{stream = Str, topic_filter = TF, return_addr = Id}) ->
-                            emqx_ds_beamformer_waitq:delete(Str, TF, Id, WaitingTab)
+                    fun(#poll_req{stream = Str, start_key = SK, return_addr = Id, topic_filter = TF}) ->
+                            ?tp(warning, waitq_on_match, #{stream => Stream, key => SK, tf => TF}),
+                            ets:delete(WaitQ, {Str, SK, Id})
                     end,
                     Reqs
                 )
             end,
-            Result = CBM:scan_stream(Shard, Stream, TopicFilter, StartKey, BatchSize),
-            case form_beams(S, GetF, OnMatch, OnNomatch, StartKey, Result) of
-                true -> maybe_fulfill_waiting(S, [{Stream, UpdatedTopic} | Rest]);
-                false -> maybe_fulfill_waiting(S, Rest)
-            end
+            Result = CBM:scan_stream(Shard, Stream, ['#'], StartKey, BatchSize),
+            _ = form_beams(S, GetF, OnMatch, OnNomatch, StartKey, Result),
+            maybe_fulfill_waiting(S, Stream, UpdatedTopic, NextKey);
+        _ ->
+            S
     end.
 
-enqueue_nomatch(#s{wait_queue = WaitingTab}) ->
-    fun(_EndKey, NoMatch) ->
-         lists:foreach(
-            fun(Req = #poll_req{stream = Stream, topic_filter = TopicFilter, return_addr = Id}) ->
-                  emqx_ds_beamformer_waitq:insert(Stream, TopicFilter, Id, Req, WaitingTab)
-            end,
-           NoMatch)
-    end.
-
-%% enqueue_nomatch(S = #s{module = CBM, shard = Shard}) ->
-%%     fun(EndKey, NoMatch) ->
-%%         lists:foreach(
-%%             fun(Req0 = #poll_req{it = It0}) ->
-%%                 case CBM:update_iterator(Shard, It0, EndKey) of
-%%                     {ok, It} ->
-%%                         Req = Req0#poll_req{start_key = EndKey, it = It},
-%%                         enqueue(Req, S);
-%%                     {error, _, _} ->
-%%                         ok
-%%                 end
+%% enqueue_nomatch(#s{wait_queue = WaitQ}) ->
+%%     fun(_EndKey, NoMatch) ->
+%%          lists:foreach(
+%%             fun(Req = #poll_req{}) ->
+%%                   freshq_push(WaitQ, Req)
 %%             end,
-%%             NoMatch
-%%         )
+%%            NoMatch)
 %%     end.
 
-
-find_waiting(Stream, Topic, Tab) ->
-    case emqx_ds_beamformer_waitq:matches(Stream, Topic, Tab) of
-        [] ->
-            undefined;
-        [Fst | _] = Matches ->
-            %% 1. Find all poll requests that match the topic of the
-            %% event
-            %%
-            %% 2. Find most common topic filter for all these events
-            %%
-            %% 3. Find the smallest DS key
-            lists:foldl(
-                fun(Req, {Acc, AccTopic, AccKey}) ->
-                    #poll_req{topic_filter = TF, start_key = StartKey} = Req,
-                    {
-                        map_pushl(StartKey, Req, Acc),
-                        common_topic_filter(AccTopic, TF),
-                        min(AccKey, StartKey)
-                    }
-                end,
-                {#{}, Fst#poll_req.topic_filter, Fst#poll_req.start_key},
-                Matches
-            )
+enqueue_nomatch(S = #s{module = CBM, shard = Shard}) ->
+    fun(EndKey, NoMatch) ->
+        lists:foreach(
+            fun(Req0 = #poll_req{it = It0}) ->
+                case CBM:update_iterator(Shard, It0, EndKey) of
+                    {ok, It} ->
+                        Req = Req0#poll_req{start_key = EndKey, it = It},
+                        enqueue(Req, S);
+                    {error, _, _} ->
+                        ok
+                end
+            end,
+            NoMatch
+        )
     end.
 
-common_topic_filter([], []) ->
-    [];
-common_topic_filter(['#'], _) ->
-    ['#'];
-common_topic_filter(_, ['#']) ->
-    ['#'];
-common_topic_filter(['+' | L1], [_ | L2]) ->
-    ['+' | common_topic_filter(L1, L2)];
-common_topic_filter([_ | L1], ['+' | L2]) ->
-    ['+' | common_topic_filter(L1, L2)];
-common_topic_filter([A | L1], [A | L2]) ->
-    [A | common_topic_filter(L1, L2)].
+%% common_topic_filter([], []) ->
+%%     [];
+%% common_topic_filter(['#'], _) ->
+%%     ['#'];
+%% common_topic_filter(_, ['#']) ->
+%%     ['#'];
+%% common_topic_filter(['+' | L1], [_ | L2]) ->
+%%     ['+' | common_topic_filter(L1, L2)];
+%% common_topic_filter([_ | L1], ['+' | L2]) ->
+%%     ['+' | common_topic_filter(L1, L2)];
+%% common_topic_filter([A | L1], [A | L2]) ->
+%%     [A | common_topic_filter(L1, L2)].
 
-map_pushl(Key, Elem, Map) ->
-    maps:update_with(Key, fun(L) -> [Elem | L] end, [Elem], Map).
+%% map_pushl(Key, Elem, Map) ->
+%%     maps:update_with(Key, fun(L) -> [Elem | L] end, [Elem], Map).
 
 %% @doc Split beam into individual batches
 -spec split(beam(ItKey, Iterator)) -> [{ItKey, emqx_ds:next_result(Iterator)}].
@@ -862,8 +855,8 @@ pack(UpdateIterator, NextKey, Reqs, Batch) ->
 
 do_pack(_Reqs, [], Acc) ->
     lists:reverse(Acc);
-do_pack(Reqs, [Elem = {Key, Msg} | Rest], Acc0) ->
-    Acc = case mk_mask(Reqs, Elem) of
+do_pack(Reqs, [{Key, Msg} | Rest], Acc0) ->
+    Acc = case mk_mask(Reqs, Key, Msg) of
               {true, DispatchMask} -> [{Key, DispatchMask, Msg} | Acc0];
               {false, _} -> Acc0
           end,
@@ -889,15 +882,16 @@ is_member(N, Mask) ->
     <<_:N, Val:1, _/bitstring>> = Mask,
     Val =:= 1.
 
--spec mk_mask([poll_req(_ItKey, _Iterator)], {emqx_ds:message_key(), emqx_types:message()}) ->
+-spec mk_mask([poll_req(_ItKey, _Iterator)], emqx_ds:message_key(), emqx_types:message()) ->
     dispatch_mask().
-mk_mask(Reqs, Elem) ->
-    mk_mask(Reqs, Elem, <<>>, false).
+mk_mask(Reqs, Key, Msg = #message{topic = Topic}) ->
+    Tokens = emqx_topic:tokens(Topic),
+    mk_mask(Reqs, Key, Tokens, Msg, <<>>, false).
 
-mk_mask([], _Elem, Acc, AnyMatch) ->
+mk_mask([], _Key, _Tokens, _Msg, Acc, AnyMatch) ->
     {AnyMatch, Acc};
-mk_mask([#poll_req{msg_matcher = Matcher} | Rest], {Key, Message} = Elem, Acc, AnyMatch) ->
-    Match = Matcher(Key, Message),
+mk_mask([#poll_req{msg_matcher = Matcher} | Rest], Key, Tokens, Message, Acc, AnyMatch) ->
+    Match = Matcher(Key, Tokens, Message),
     Val =
         case Match of
             true -> 1;
@@ -905,7 +899,7 @@ mk_mask([#poll_req{msg_matcher = Matcher} | Rest], {Key, Message} = Elem, Acc, A
         end,
     mk_mask(
       Rest,
-      Elem,
+      Key, Tokens, Message,
       <<Acc/bitstring, Val:1>>,
       AnyMatch or Match
      ).

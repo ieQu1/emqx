@@ -311,7 +311,7 @@ message_matcher(_Shard, #s{trie = Trie}, #it{
 }) ->
     {ok, TopicStructure} = emqx_ds_lts:reverse_lookup(Trie, StaticIdx),
     TF = emqx_ds_lts:decompress_topic(TopicStructure, words(CTF)),
-    fun(MsgKey, #message{topic = Topic}) ->
+    fun(MsgKey, Topic, #message{}) ->
         case match_ds_key(StaticIdx, MsgKey) of
             false ->
                 ?tp_ignore_side_effects_in_prod(emqx_ds_storage_skipstream_lts_matcher, #{
@@ -332,7 +332,7 @@ message_matcher(_Shard, #s{trie = Trie}, #it{
                 %% 2^64 arithmetic, so in this context `?max_ts' means
                 %% 0.
                 (LastSeenTS =:= ?max_ts orelse TS > LastSeenTS) andalso
-                    emqx_topic:match(words(Topic), TF)
+                    emqx_topic:match(Topic, TF)
         end
     end.
 
@@ -551,6 +551,8 @@ do_delete(CF, Batch, Static, KeyFamily, MsgKey) ->
 init_iterators(S, #it{static_index = Static, compressed_tf = CompressedTF}) ->
     do_init_iterators(S, Static, words(CompressedTF), 1).
 
+do_init_iterators(S, Static, ['#'], WildcardLevel) ->
+    do_init_iterators(S, Static, [], WildcardLevel);
 do_init_iterators(S, Static, ['+' | TopicFilter], WildcardLevel) ->
     %% Ignore wildcard levels in the topic filter because it has no value to index '+'
     do_init_iterators(S, Static, TopicFilter, WildcardLevel + 1);
