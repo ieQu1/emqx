@@ -11,13 +11,13 @@ BEGIN
   Stream ::= SEQUENCE {
     shard OCTET STRING,
     generation INTEGER,
-    inner DSBuiltinStorageLayer.Stream
+    inner OCTET STRING
   }
 
   Iterator ::= SEQUENCE {
     shard OCTET STRING,
     generation INTEGER,
-    inner DSBuiltinStorageLayer.Iterator
+    inner OCTET STRING
   }
 
   -- Encoding of iterator or end_of_stream

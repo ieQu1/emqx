@@ -85,8 +85,7 @@
 
 -type s() :: #s{}.
 
--define(asn1name, skipstreamV2).
--define(stream(STATIC), {?asn1name, STATIC}).
+-define(stream(STATIC), STATIC).
 
 %% Internal iterator
 -record(it, {
@@ -427,15 +426,18 @@ trie_cf(GenId) ->
 
 %%%%%%%% External iterator format %%%%%%%%%%
 
-%% @doc Transform iterator from/to the external serializable representation
+%% @doc Transform iterator from/to the external representation (binary)
 it2ext(#it{static_index = Static, last_key = LastKey, compressed_tf = Varying}) ->
-    {?asn1name, #'Iterator'{
+    {ok, Ext} = 'DSBuiltinSLSkipstreamV2':encode('Iterator', #'Iterator'{
         static = Static,
         lastKey = LastKey,
         topicFilter = emqx_ds_lib:tf_to_asn1(Varying)
-    }}.
+    }),
+    Ext.
 
-ext2it({?asn1name, #'Iterator'{static = Static, lastKey = LastKey, topicFilter = Varying}}) ->
+ext2it(Ext) when is_binary(Ext) ->
+    {ok, #'Iterator'{static = Static, lastKey = LastKey, topicFilter = Varying}} =
+        'DSBuiltinSLSkipstreamV2':decode('Iterator', Ext),
     #it{
         static_index = Static,
         last_key = LastKey,
