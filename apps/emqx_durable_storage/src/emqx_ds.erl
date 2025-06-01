@@ -171,13 +171,16 @@ It takes care of forwarding calls to the underlying DBMS.
 
 -doc """
 Precondition.
-Fails whole batch if the storage already has the matching message (`if_exists'),
-or does not yet have (`unless_exists'). Here "matching" means that it either
-just exists (when pattern is '_') or has exactly the same payload, rest of the
-message fields are irrelevant.
-Useful to construct batches with "compare-and-set" semantics.
-Note: backends may not support this, but if they do only DBs with `atomic_batches'
-enabled are expected to support preconditions in batches.
+
+Fails whole batch if the storage already has the matching message
+(`if_exists`), or does not yet have (`unless_exists`). Here "matching"
+means that it either just exists (when pattern is '_') or has exactly
+the same payload, rest of the message fields are irrelevant.
+
+Useful to construct batches with "compare-and-set" semantics. Note:
+backends may not support this, but if they do only DBs with
+`atomic_batches` enabled are expected to support preconditions in
+batches.
 """.
 -type precondition() ::
     {if_exists | unless_exists, message_matcher(iodata() | '_')}.
@@ -999,14 +1002,14 @@ The following is guaranteed, though:
   messages. Also, indiscriminate flushing such messages must be
   avoided.
 
-- If `sync` is `true`, `{atomic, Serial, Ret}' tuple is returned on
+- If `sync = true`, `{atomic, Serial, Ret}` tuple is returned on
   successful commit. `Serial` is a shard-unique monotonically
   increasing binary identifying the transaction.
 
 - Errors are returned as usual for DS.
 
 - Precondition failures result in
-  `{error, unrecoverable, {precondition_failed, _}}' commit
+  `{error, unrecoverable, {precondition_failed, _}}` commit
   outcome.
 
 """.
