@@ -4,14 +4,14 @@
 
 DSBuiltinSLSkipstreamV2 DEFINITIONS AUTOMATIC TAGS ::=
 BEGIN
-  EXPORTS ALL;
   IMPORTS TopicFilter FROM DSMetadataCommon;
 
   Stream ::= OCTET STRING
 
-  Iterator ::= SEQUENCE {
+  IteratorStatic ::= SEQUENCE {
     static OCTET STRING,
-    lastKey OCTET STRING,
     topicFilter TopicFilter
   }
+
+  -- Iterator position is key that is already a binary
 END

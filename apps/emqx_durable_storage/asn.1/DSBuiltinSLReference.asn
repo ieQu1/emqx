@@ -5,9 +5,16 @@
 -- Metadata definitions for emqx_ds_storage_reference module
 DSBuiltinSLReference DEFINITIONS AUTOMATIC TAGS ::=
 BEGIN
-  EXPORTS ALL;
+  IMPORTS TopicFilter FROM DSMetadataCommon;
 
   Stream ::= NULL
 
-  Iterator ::= OCTET STRING
+  IteratorStatic ::= SEQUENCE {
+    topicFilter TopicFilter,
+    startTime INTEGER
+  }
+
+  IteratorPos ::= SEQUENCE {
+    pos OCTET STRING OPTIONAL
+  }
 END
