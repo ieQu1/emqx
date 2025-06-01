@@ -2,18 +2,30 @@
 #+PROPERTY: header-args :eval no-export :exports both
 #+PROPERTY: header-args:sh :results output drawer :dir /docker:root@dev-cluster-emqx1-1:/opt/emqx
 #+PROPERTY: header-args:erlang :tangle ../src/emqx_ds_otx_test.erl
-#+PROPERTY: header-args:python :session *python*
 #+PROPERTY: header-args:elisp :exports none
-#+STARTUP: hideblocks
+#+OPTIONS: ^:nil
+#+STARTUP: overview fold
 #+LATEX_HEADER: \usepackage{graphicx}
 #+LATEX_HEADER: \lstset{basicstyle=\fontsize{8}{8}}
-
 
 * Traffic generator
 
 This file contains an embedded traffic generator that starts an ensemble of processes on different nodes that run a specified function.
 
 Scenarios implemented with this generator have two general variables: =N= and =Nnodes=.
+=N= denotes the number of independent workers, =Nnodes= denotes the number of competing workers running on different nodes.
+
+All tests run on a variety of DBs:
+
+| DB   | Type | Backend        | Replicas | Reads  |
+|------+------+----------------+----------+--------|
+| d1l  | DS   | raft,rocksdb   |        1 | local  |
+| d3l  | DS   | raft,rocksdb   |        3 | local  |
+| d5L  | DS   | raft,rocksdb   |        5 | leader |
+| dloc | DS   | local,rocksdb  |        1 | local  |
+| md   | mria | disc_copies    |      2+3 | n/a    |
+| mr   | mria | rocksdb_copies |      2+3 | n/a    |
+| mloc | mria | rocksdb_copies |        1 | local  |
 
 #+begin_src erlang :exports none
 %% Generated file, do not edit
@@ -57,34 +69,49 @@ l() ->
 #+RESULTS:
 : my-run-in-docker
 
+Default DS DB settings:
 
-#+begin_src erlang :export no
+#+begin_src erlang
+default_ds_settings() ->
+  #{ store_ttv => true
+   , n_shards => 16
+   , replication_options => #{}
+   , n_sites => 5
+   , replication_factor => 5
+   , storage => {emqx_ds_storage_skipstream_lts_v2, #{}}
+   , transaction => #{flush_interval => 1, idle_flush_interval => 1, conflict_window => 10_000}
+   , reads => local_preferred
+   , replication => true
+   }.
+#+end_src
+
+#+begin_src erlang :exports none
 create_db(UserOpts = #{db := DB, type := ds}) ->
-    DB = maps:get(db, UserOpts, t),
-    Defaults = #{
-        backend => builtin_raft,
-        store_ttv => true,
-        n_shards => 16,
-        replication_options => #{},
-        n_sites => 5,
-        replication_factor => 5,
-        storage => {emqx_ds_storage_skipstream_lts_v2, #{}},
-        transaction => #{flush_interval => 10, idle_flush_interval => 1, conflict_window => 10_000},
-        reads => local_preferred
-    },
-    Opts = emqx_utils_maps:deep_merge(Defaults, maps:remove(db, UserOpts)),
-    multicall(fun() -> emqx_ds:open_db(DB, Opts) end);
+  DB = maps:get(db, UserOpts, t),
+  Defaults = default_ds_settings(),
+  Opts = emqx_utils_maps:deep_merge(Defaults, maps:remove(db, UserOpts)),
+  case Opts of
+    #{replication := true} ->
+      multicall(fun() -> emqx_ds:open_db(DB, Opts#{backend => builtin_raft}) end);
+    #{replication := false} ->
+      emqx_ds:open_db(DB, Opts#{backend => builtin_local})
+  end;
 create_db(UserOpts = #{db := DB, type := mria}) ->
-    Opts = maps:merge(
-        #{type => ordered_set, storage => rocksdb_copies, rlog_shard => ?MRIA_SHARD},
-        maps:without([db, rlog_shard, type], UserOpts)
-    ),
-    multicall(
+  Opts = maps:merge(
+           #{type => ordered_set, storage => rocksdb_copies, rlog_shard => ?MRIA_SHARD},
+           maps:without([db, rlog_shard, type, replication], UserOpts)
+          ),
+  case maps:get(replication, UserOpts, true) of
+    true ->
+      multicall(
         fun() ->
             ok = mria:create_table(DB, maps:to_list(Opts)),
             ok = mria:wait_for_tables([DB])
-        end
-    ).
+        end);
+    false ->
+      ok = mria:create_table(DB, maps:to_list(Opts)),
+      ok = mria:wait_for_tables([DB])
+  end.
 #+end_src
 
 Create a standard set of test databases with different parameters:
@@ -98,6 +125,10 @@ test_dbs() ->
   %% , #{type => ds, db => d3L, replication_factor => 3, reads => leader_preferred}
   , #{type => ds, db => d5l, replication_factor => 5, reads => local_preferred}
   , #{type => ds, db => d5L, replication_factor => 5, reads => leader_preferred}
+  , #{type => ds, db => d1l, replication_factor => 1, reads => local_preferred, replication => false}
+  %% Local DBs without replicas (for comparison)
+  , #{type => ds, db => dloc, replication => false}
+  , #{type => mria, db => mloc, replication => false}
   ].
 
 create_dbs() ->
@@ -105,96 +136,14 @@ create_dbs() ->
 #+end_src
 
 #+begin_src elisp :exports none
-(my-run-in-docker "emqx_ds_otx_test:create_dbs()")
+(my-run-in-docker "emqx_ds_otx_test:l(), emqx_ds_otx_test:create_dbs().")
 #+end_src
 
 
 #+RESULTS:
-: #<window 17 on *Async Shell Command*>
+: #<window 251 on *Async Shell Command*>
 
 * Data processing
-** Histogram
-
-Subroutines to create histograms:
-
-#+begin_src python :exports none
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import os
-import math
-
-def mgroups(df):
-    """Group data by measurement type"""
-    # Measurement types:
-    mtypes = df.columns.to_list()
-    mtypes.pop()
-    # Group data by measurement type:
-    return df.groupby(mtypes, sort=False)
-
-# Style of hisogram where plots are overlayed
-def histogram_vs_overlayed(df, title):
-    """Calculate a histogram for each measurement type, then plot them all overlayed"""
-    plt.figure(dpi=200)
-    plt.title(title)
-    bins = np.linspace(df['Val'].min(), df['Val'].max(), 100)
-    plt.xlabel('Transaction Time, μS')
-    plt.ylabel('Frequency')
-    grps = mgroups(df),
-    for i in mgroups(df):
-        counts, bin_edges = np.histogram(i[1]['Val'], bins=50)
-        label=','.join(map(str, i[0]))
-        plt.hist(bin_edges[:-1], bins=bins, weights=counts, alpha=1, label=label, linewidth=1, histtype='step')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.legend()
-    fn = title + ".png"
-    plt.savefig(fn)
-    return fn
-
-# Style of histogram with subplots
-def histogram_vs_separate(df, title):
-    # Measurement types:
-    mtypes = df.columns.to_list()
-    mtypes.pop()
-    # Use the same bins for everything:
-    bins = np.linspace(df['Val'].min(), df['Val'].max(), 100)
-    # Plot it
-    df.hist(column='Val', grid=True, by=mtypes, sharex=True, sharey=True, bins=bins, histtype='stepfilled')
-    plt.tight_layout()
-    fn = title + ".hist.png"
-    plt.savefig(fn)
-    return fn
-
-def histogram_vs(df, title):
-    plt.close()
-    #return histogram_vs_overlayed(df, title)
-    return histogram_vs_separate(df, title)
-
-def boxplot_vs(df, title):
-    plt.close()
-    fn = title + ".bp.png"
-    df.boxplot(column='Val', by='DB', flierprops=dict(marker='.', markersize=2), whis=(0, 100))
-    plt.savefig(fn)
-    return fn
-#+end_src
-
-#+RESULTS:
-: None
-
-** Load data
-CSV file generation by the loadgen:
-
-#+begin_src erlang
-open_csv(Experiment, ColumnNames) ->
-    Filename = filename:join(emqx:data_dir(), Experiment ++ ".csv"),
-    IsNew = not filelib:is_file(Filename),
-    {ok, FD} = file:open(Filename, [append]),
-    %% Insert CSV header:
-    IsNew andalso
-        io:format(FD, "~s;Metric;Val~n", [lists:join(";", ColumnNames)]),
-    FD.
-#+end_src
 
 Delete old data:
 
@@ -206,23 +155,9 @@ rm /opt/emqx/data/*.csv
 :results:
 :end:
 
-Copy CSVs from docker and parse it:
-
-#+begin_src python :results discard
-import pandas as pd
-import os
-
-os.system("docker cp dev-cluster-emqx1-1:/opt/emqx/data/counter.csv .")
-df_cntr = pd.read_csv('counter.csv', sep=';')
-
-os.system("docker cp dev-cluster-emqx1-1:/opt/emqx/data/owned_counter.csv .")
-df_ocntr = pd.read_csv('owned_counter.csv', sep=';')
-#+end_src
-
 #+RESULTS:
 
 * Test scenarios
-
 ** Naive counter increment
 
 A naive and inefficient implementation of counter increment by reading data from the DB, incrementing it and writing it back.
@@ -319,7 +254,7 @@ counter_test(UserOpts = #{db := DB, type := _}) ->
       false
   end;
 counter_test(UserOpts) ->
-  [?FUNCTION_NAME(maps:merge(UserOpts, maps:with([db, type], I))) || I <- test_dbs()].
+  [?FUNCTION_NAME(maps:merge(UserOpts, maps:with([db, type, replication], I))) || I <- test_dbs()].
 #+end_src
 
 Verification of counter values:
@@ -355,99 +290,13 @@ verify_counters(#{db := DB, n := N, type := ds}, ExpectedVal) ->
     end.
 #+end_src
 
-
-#+RESULTS:
-: #<buffer *perf-test*>
-
-*** 1k parallel workers, no sleep, no conflicts
-
-#+begin_src elisp :exports none
-(my-run-in-docker "emqx_ds_otx_test:l(), emqx_ds_otx_test:counter_test(#{n => 1000, repeats => 100, test_timeout => 60_000}), all_done.")
-#+end_src
-
-#+RESULTS:
-: #<window 54 on *Async Shell Command*>
-
-
-#+begin_src python :results file
-c1ks0 = df_cntr[(df_cntr['Nnodes'] == 1) & (df_cntr['N'] == 1000) & (df_cntr['Sleep'] == 0)]
-histogram_vs(c1ks0, "1k naive counters, no sleep")
-#+end_src
-
-#+RESULTS:
-[[file:1k naive counters, no sleep.hist.png]]
-
-#+begin_src python :results file
-boxplot_vs(c1ks0, "1k naive counters, no sleep")
-#+end_src
-
-#+RESULTS:
-[[file:1k naive counters, no sleep.bp.png]]
-
-#+begin_src python :results value table
-mgroups(fdf).count()
-#+end_src
-
-#+RESULTS:
-|   |
-
-*** 10k parallel workers, no sleep, no conflicts
-
-#+begin_src elisp :exports none
-(my-run-in-docker "emqx_ds_otx_test:l(), emqx_ds_otx_test:counter_test(#{n => 10000, repeats => 100, test_timeout => 300_000}), all_done.")
-#+end_src
-
-#+RESULTS:
-: #<window 54 on *Async Shell Command*>
-
-
-#+begin_src python :results file
-c10ks0 = df_cntr[(df_cntr['Nnodes'] == 1) & (df_cntr['N'] == 10000) & (df_cntr['Sleep'] == 0)]
-histogram_vs(c10ks0, "10k naive counters, no sleep")
-#+end_src
-
-#+RESULTS:
-[[file:10k naive counters, no sleep.hist.png]]
-
-
-#+begin_src python :results file
-boxplot_vs(c10ks0, "10k naive counters, no sleep")
-#+end_src
-
-#+RESULTS:
-[[file:10k naive counters, no sleep.bp.png]]
-
-
-*** 10k parallel workers, sleep 30ms, no conflicts
-
-#+begin_src elisp :exports none
-(my-run-in-docker "emqx_ds_otx_test:l(), emqx_ds_otx_test:counter_test(#{n => 10000, repeats => 30, sleep => 30, test_timeout => 300_000}), all_done.")
-#+end_src
-
-#+RESULTS:
-: #<window 54 on *Async Shell Command*>
-
-
-#+begin_src python :results file
-c10ks30 = df_cntr[(df_cntr['Nnodes'] == 1) & (df_cntr['N'] == 10000) & (df_cntr['Sleep'] == 30)]
-histogram_vs(c10ks30, "10k naive counters, 30ms sleep")
-#+end_src
-
-#+RESULTS:
-[[file:10k naive counters, 30ms sleep.hist.png]]
-
-
-#+begin_src python :results file
-boxplot_vs(c10ks30, "10k naive counters, 30ms sleep")
-#+end_src
-
-#+RESULTS:
-[[file:10k naive counters, 30ms sleep.bp.png]]
-
-
 ** Owned counter increment
-
 Reading data from DB, processing it and writing it back is not the best approach.
+
+A more optimized approach is when a process takes ownership over a record by writing a unique ID to a separate "guard" record, and then issues a transaction that
+
+- Checks that the unique ID didn't change
+- Overwrites the data
 
 Take ownership over counter:
 
@@ -577,8 +426,115 @@ owned_counter_test(UserOpts = #{db := DB, type := _}) ->
       false
   end;
 owned_counter_test(UserOpts) ->
-  [?FUNCTION_NAME(maps:merge(UserOpts, maps:with([db, type], I))) || I <- test_dbs()].
+  [?FUNCTION_NAME(maps:merge(UserOpts, maps:with([db, type, replication], I))) || I <- test_dbs()].
 #+end_src
+
+* Results, baseline
+#+PROPERTY: header-args:python :session *python-baseline* :dir baseline
+
+Copy CSVs from docker and parse it:
+
+#+begin_src python :results discard :noweb yes :exports none
+<<python-init>>
+
+os.system("docker cp dev-cluster-emqx1-1:/opt/emqx/data/counter.csv .")
+df_cntr = pd.read_csv('counter.csv', sep=';')
+
+os.system("docker cp dev-cluster-emqx1-1:/opt/emqx/data/owned_counter.csv .")
+df_ocntr = pd.read_csv('owned_counter.csv', sep=';')
+#+end_src
+
+#+RESULTS:
+
+** Naive counter increment
+
+*** 1k parallel workers, no sleep, no conflicts
+
+#+begin_src elisp :exports none
+(my-run-in-docker "emqx_ds_otx_test:l(), emqx_ds_otx_test:counter_test(#{n => 1000, repeats => 100, test_timeout => 60_000}), all_done.")
+#+end_src
+
+#+RESULTS:
+: #<window 234 on *Async Shell Command*>
+
+
+#+begin_src python :results file
+c1ks0 = df_cntr[(df_cntr['Nnodes'] == 1) & (df_cntr['N'] == 1000) & (df_cntr['Sleep'] == 0)]
+histogram_vs(c1ks0, "1k naive counters, no sleep")
+#+end_src
+
+#+RESULTS:
+[[file:baseline/1k naive counters, no sleep.hist.png]]
+
+#+begin_src python :results file
+boxplot_vs(c1ks0, "1k naive counters, no sleep")
+#+end_src
+
+#+RESULTS:
+[[file:baseline/1k naive counters, no sleep.bp.png]]
+
+#+begin_src python :results value table
+mgroups(fdf).count()
+#+end_src
+
+
+
+*** 10k parallel workers, no sleep, no conflicts
+
+Run it:
+#+begin_src elisp :exports none
+(my-run-in-docker "emqx_ds_otx_test:l(), emqx_ds_otx_test:counter_test(#{n => 10000, repeats => 100, test_timeout => 300_000}), all_done.")
+#+end_src
+
+#+RESULTS:
+: #<window 251 on *Async Shell Command*>
+
+
+#+begin_src python :results file
+c10ks0 = df_cntr[(df_cntr['Nnodes'] == 1) & (df_cntr['N'] == 10000) & (df_cntr['Sleep'] == 0)]
+histogram_vs(c10ks0, "10k naive counters, no sleep")
+#+end_src
+
+#+RESULTS:
+[[file:baseline/10k naive counters, no sleep.hist.png]]
+
+
+#+begin_src python :results file
+boxplot_vs(c10ks0, "10k naive counters, no sleep")
+#+end_src
+
+#+RESULTS:
+[[file:baseline/10k naive counters, no sleep.bp.png]]
+
+
+*** 10k parallel workers, sleep 30ms, no conflicts
+
+#+begin_src elisp :exports none
+(my-run-in-docker "emqx_ds_otx_test:l(), emqx_ds_otx_test:counter_test(#{n => 10000, repeats => 30, sleep => 30, test_timeout => 300_000}), all_done.")
+#+end_src
+
+#+RESULTS:
+: #<window 250 on *Async Shell Command*>
+
+
+#+begin_src python :results file
+c10ks30 = df_cntr[(df_cntr['Nnodes'] == 1) & (df_cntr['N'] == 10000) & (df_cntr['Sleep'] == 30)]
+histogram_vs(c10ks30, "10k naive counters, 30ms sleep")
+#+end_src
+
+#+RESULTS:
+[[file:baseline/10k naive counters, 30ms sleep.hist.png]]
+
+
+#+begin_src python :results file
+boxplot_vs(c10ks30, "10k naive counters, 30ms sleep")
+#+end_src
+
+#+RESULTS:
+[[file:baseline/10k naive counters, 30ms sleep.bp.png]]
+
+
+** Owned counter increment
 
 *** 10k parallel workers, no conflicts
 
@@ -587,7 +543,7 @@ owned_counter_test(UserOpts) ->
 #+end_src
 
 #+RESULTS:
-: #<window 54 on *Async Shell Command*>
+: #<window 251 on *Async Shell Command*>
 
 Increment:
 #+begin_src python :results file
@@ -596,14 +552,14 @@ histogram_vs(owc10ki, "10k owned counters, no conflicts, increment")
 #+end_src
 
 #+RESULTS:
-[[file:10k owned counters, no conflicts, increment.hist.png]]
+[[file:baseline/10k owned counters, no conflicts, increment.hist.png]]
 
 #+begin_src python :results file :exports result
 boxplot_vs(owc10ki, "10k owned counters, no conflicts, increment")
 #+end_src
 
 #+RESULTS:
-[[file:10k owned counters, no conflicts, increment.bp.png]]
+[[file:baseline/10k owned counters, no conflicts, increment.bp.png]]
 
 
 #+begin_src python :results file
@@ -612,7 +568,7 @@ histogram_vs(owc10ko, "10k owned counters, no conflicts, own")
 #+end_src
 
 #+RESULTS:
-[[file:10k owned counters, no conflicts, own.hist.png]]
+[[file:baseline/10k owned counters, no conflicts, own.hist.png]]
 
 * Appendix A: Test harness
 
@@ -643,7 +599,8 @@ histogram_vs(owc10ko, "10k owned counters, no conflicts, own")
         n_nodes => pos_integer(),
         available_nodes => [node()],
         test_timeout => timeout(),
-        repeats => pos_integer()
+        repeats => pos_integer(),
+        replication => boolean()
     },
     fun((_MyId :: pos_integer(), _Opts :: map(), Acc | undefined) -> Acc),
     string(),
@@ -653,8 +610,14 @@ histogram_vs(owc10ko, "10k owned counters, no conflicts, own")
     boolean().
 exec_test(UserOpts, Fun, ExperimentName, ColumNames, MeasurementFields) ->
     CSV = open_csv(ExperimentName, ColumNames),
+    AvailNodes = case maps:get(replication, UserOpts, true) of
+                   true ->
+                     [node() | nodes()];
+                   false ->
+                     [node()]
+                 end,
     Defaults = #{
-        available_nodes => [node() | nodes()],
+        available_nodes => AvailNodes,
         n_nodes => 1,
         test_timeout => infinity
     },
@@ -809,3 +772,86 @@ with_metric(Metric, Fun) ->
     report_metric(Metric, T1 - T0)
   end.
 #+end_src
+
+* Appendix B: Metrics and data processing
+
+CSV file generation by the loadgen:
+
+#+begin_src erlang
+open_csv(Experiment, ColumnNames) ->
+    Filename = filename:join(emqx:data_dir(), Experiment ++ ".csv"),
+    IsNew = not filelib:is_file(Filename),
+    {ok, FD} = file:open(Filename, [append]),
+    %% Insert CSV header:
+    IsNew andalso
+        io:format(FD, "~s;Metric;Val~n", [lists:join(";", ColumnNames)]),
+    FD.
+#+end_src
+
+Subroutines to create histograms:
+
+#+name: python-init
+#+begin_src python :exports code
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import math
+
+def mgroups(df):
+    """Group data by measurement type"""
+    # Measurement types:
+    mtypes = df.columns.to_list()
+    mtypes.pop()
+    # Group data by measurement type:
+    return df.groupby(mtypes, sort=False)
+
+# Style of hisogram where plots are overlayed
+def histogram_vs_overlayed(df, title):
+    """Calculate a histogram for each measurement type, then plot them all overlayed"""
+    plt.figure(dpi=200)
+    plt.title(title)
+    bins = np.linspace(df['Val'].min(), df['Val'].max(), 100)
+    plt.xlabel('Transaction Time, μS')
+    plt.ylabel('Frequency')
+    grps = mgroups(df),
+    for i in mgroups(df):
+        counts, bin_edges = np.histogram(i[1]['Val'], bins=50)
+        label=','.join(map(str, i[0]))
+        plt.hist(bin_edges[:-1], bins=bins, weights=counts, alpha=1, label=label, linewidth=1, histtype='step')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.legend()
+    fn = title + ".png"
+    plt.savefig(fn)
+    return fn
+
+# Style of histogram with subplots
+def histogram_vs_separate(df, title):
+    # Measurement types:
+    mtypes = df.columns.to_list()
+    mtypes.pop()
+    # Use the same bins for everything:
+    bins = np.linspace(df['Val'].min(), df['Val'].max(), 100)
+    # Plot it
+    df.hist(column='Val', grid=True, by=mtypes, sharex=True, sharey=True, bins=bins, histtype='stepfilled', figsize = (10, 10))
+    plt.tight_layout()
+    fn = title + ".hist.png"
+    plt.savefig(fn)
+    return fn
+
+def histogram_vs(df, title):
+    plt.close()
+    #return histogram_vs_overlayed(df, title)
+    return histogram_vs_separate(df, title)
+
+def boxplot_vs(df, title):
+    plt.close()
+    fn = title + ".bp.png"
+    df.boxplot(column='Val', by='DB', flierprops=dict(marker='.', markersize=2), whis=(0, 100))
+    plt.savefig(fn)
+    return fn
+#+end_src
+
+#+RESULTS: python-init
+: None
