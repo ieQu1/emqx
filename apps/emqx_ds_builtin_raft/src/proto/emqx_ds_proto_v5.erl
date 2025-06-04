@@ -66,7 +66,7 @@ make_iterator(Node, DB, Shard, Stream, TopicFilter, StartTime) ->
     node(),
     emqx_ds:db(),
     emqx_ds_replication_layer:shard_id(),
-    emqx_ds_storage_layer:iterator(),
+    emqx_ds_storage_layer:old_iterator(),
     pos_integer()
 ) ->
     emqx_rpc:call_result(emqx_ds:next_result()).
@@ -91,7 +91,7 @@ store_batch(Node, DB, Shard, Batch, Options) ->
     node(),
     emqx_ds:db(),
     emqx_ds_replication_layer:shard_id(),
-    emqx_ds_storage_layer:iterator(),
+    emqx_ds_storage_layer:old_iterator(),
     emqx_ds:message_key()
 ) ->
     emqx_ds:make_iterator_result().
@@ -105,7 +105,7 @@ update_iterator(Node, DB, Shard, OldIter, DSKey) ->
     node(),
     emqx_ds:db(),
     emqx_ds_replication_layer:shard_id(),
-    [{emqx_ds_beamformer:return_addr(_), emqx_ds_storage_layer:iterator()}],
+    [{emqx_ds_beamformer:return_addr(_), emqx_ds_storage_layer:old_iterator()}],
     emqx_ds:poll_opts()
 ) ->
     ok.

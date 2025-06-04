@@ -201,7 +201,7 @@
     #{
         ?tag := ?IT,
         ?shard := shard_id(),
-        ?enc := emqx_ds_storage_layer:iterator()
+        ?enc := emqx_ds_storage_layer:old_iterator()
     }.
 
 -opaque delete_iterator() ::
@@ -772,7 +772,7 @@ do_get_streams_v2(DB, Shard, TopicFilter, StartTime) ->
     emqx_ds:topic_filter(),
     emqx_ds:time()
 ) ->
-    emqx_ds:make_iterator_result(emqx_ds_storage_layer:iterator()).
+    emqx_ds:make_iterator_result(emqx_ds_storage_layer:old_iterator()).
 do_make_iterator_v2(DB, Shard, Stream, TopicFilter, StartTime) ->
     ShardId = {DB, Shard},
     ?IF_SHARD_READY(
@@ -794,20 +794,20 @@ do_make_delete_iterator_v4(DB, Shard, Stream, TopicFilter, StartTime) ->
 -spec do_update_iterator_v2(
     emqx_ds:db(),
     shard_id(),
-    emqx_ds_storage_layer:iterator(),
+    emqx_ds_storage_layer:old_iterator(),
     emqx_ds:message_key()
 ) ->
-    emqx_ds:make_iterator_result(emqx_ds_storage_layer:iterator()).
+    emqx_ds:make_iterator_result(emqx_ds_storage_layer:old_iterator()).
 do_update_iterator_v2(DB, Shard, OldIter, DSKey) ->
     emqx_ds_storage_layer:update_iterator({DB, Shard}, OldIter, DSKey).
 
 -spec do_next_v1(
     emqx_ds:db(),
     shard_id(),
-    emqx_ds_storage_layer:iterator(),
+    emqx_ds_storage_layer:old_iterator(),
     pos_integer()
 ) ->
-    emqx_ds:next_result(emqx_ds_storage_layer:iterator()).
+    emqx_ds:next_result(emqx_ds_storage_layer:old_iterator()).
 do_next_v1(DB, Shard, Iter, BatchSize) ->
     ShardId = {DB, Shard},
     ?IF_SHARD_READY(
@@ -862,7 +862,7 @@ do_get_delete_streams_v4(DB, Shard, TopicFilter, StartTime) ->
     node(),
     emqx_ds:db(),
     shard_id(),
-    [{emqx_ds_beamformer:return_addr(_), emqx_ds_storage_layer:iterator()}],
+    [{emqx_ds_beamformer:return_addr(_), emqx_ds_storage_layer:old_iterator()}],
     emqx_ds:poll_opts()
 ) ->
     ok.

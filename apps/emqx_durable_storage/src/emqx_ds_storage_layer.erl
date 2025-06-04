@@ -21,7 +21,7 @@
 
     get_streams/3,
     get_delete_streams/3,
-    make_iterator/4,
+    make_iterator/5,
     make_delete_iterator/4,
     update_iterator/3,
     next/4,
@@ -31,7 +31,7 @@
     %% Beamformer
     unpack_iterator/2,
     scan_stream/6,
-    high_watermark/3,
+    high_watermark/4,
     fast_forward/4,
     message_match_context/4,
     iterator_match_context/2,
@@ -76,7 +76,6 @@
 -export([db_dir/1, base_dir/0, generation_get/2, get_gvars/1]).
 
 -export_type([
-    gen_id/0,
     generation/0,
     generation_data/0,
     batch/0,
@@ -84,7 +83,6 @@
     cf_refs/0,
     stream/0,
     delete_stream/0,
-    stream_v1/0,
     iterator/0,
     delete_iterator/0,
     dbshard/0,
@@ -92,16 +90,17 @@
     prototype/0,
     cooked_batch/0,
     batch_store_opts/0,
-    poll_iterators/0,
     event_dispatch_f/0
 ]).
 
 -include("emqx_ds.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include("../gen_src/DSBuiltinMetadata.hrl").
+
+-define(stream_v2(GENERATION, INNER), [GENERATION | INNER]).
 
 -define(REF(ShardId), {via, gproc, {n, l, {?MODULE, ShardId}}}).
 
--define(stream_v2(GENERATION, INNER), [GENERATION | INNER]).
 -define(delete_stream(GENERATION, INNER), [GENERATION | INNER]).
 
 %% Wrappers for the storage events:
@@ -112,13 +111,9 @@
 %% Type declarations
 %%================================================================================
 
--define(APP, emqx_durable_storage).
-
 %% # "Record" integer keys.  We use maps with integer keys to avoid persisting and sending
 %% records over the wire.
 %% tags:
--define(STREAM, 1).
--define(IT, 2).
 -define(DELETE_IT, 3).
 -define(COOKED_BATCH, 4).
 
@@ -126,6 +121,18 @@
 -define(tag, 1).
 -define(generation, 2).
 -define(enc, 3).
+
+-define(APP, emqx_durable_storage).
+
+-type inner_static() :: binary().
+-type inner_pos() :: binary().
+
+-type iterator() :: #'Iterator'{
+    shard :: emqx_ds:shard(),
+    generation :: emqx_ds:generation(),
+    innerStatic :: inner_static(),
+    innerPos :: inner_pos()
+}.
 
 -type prototype() ::
     {emqx_ds_storage_reference, emqx_ds_storage_reference:options()}
@@ -166,27 +173,11 @@
 %% Options affecting how batches should be prepared.
 -type batch_prepare_opts() :: #{}.
 
-%% TODO: kept for BPAPI compatibility. Remove me on EMQX v5.6
--opaque stream_v1() ::
-    #{
-        ?tag := ?STREAM,
-        ?generation := gen_id(),
-        ?enc := term()
-    }.
-
 %% Note: this might be stored permanently on a remote node.
 -opaque stream() :: nonempty_maybe_improper_list(gen_id(), term()).
 
 %% Note: this might be stored permanently on a remote node.
 -opaque delete_stream() :: stream().
-
-%% Note: this might be stored permanently on a remote node.
--opaque iterator() ::
-    #{
-        ?tag := ?IT,
-        ?generation := gen_id(),
-        ?enc := term()
-    }.
 
 %% Note: this might be stored permanently on a remote node.
 -opaque delete_iterator() ::
@@ -268,8 +259,6 @@
 
 -type options() :: map().
 
--type poll_iterators() :: [{_UserData, iterator()}].
-
 -define(ERR_GEN_GONE, {error, unrecoverable, generation_not_found}).
 -define(ERR_BUFF_FULL, {error, recoverable, reached_max}).
 
@@ -325,7 +314,23 @@
 -callback make_iterator(
     dbshard(), generation_data(), _Stream, emqx_ds:topic_filter(), emqx_ds:time()
 ) ->
-    emqx_ds:make_iterator_result(_Iterator).
+    {ok, _InnerStatic :: binary(), _InnerPos :: binary()} | emqx_ds:error(_).
+
+-callback unpack_iterator(
+    dbshard(),
+    generation_data(),
+    inner_static(),
+    inner_pos()
+) ->
+    {_InnerStream, emqx_ds:topic_filter(), emqx_ds:message_key()}.
+
+-callback update_iterator(
+    dbshard(),
+    generation_data(),
+    inner_static(),
+    emqx_ds:message_key()
+) ->
+    {ok, inner_pos()} | {error, _}.
 
 -callback make_delete_iterator(
     dbshard(), generation_data(), _DeleteStream, emqx_ds:topic_filter(), emqx_ds:time()
@@ -333,9 +338,15 @@
     emqx_ds:make_delete_iterator_result(_Iterator).
 
 -callback next(
-    dbshard(), generation_data(), Iter, pos_integer(), emqx_ds:time(), _IsCurrent :: boolean()
+    dbshard(),
+    generation_data(),
+    inner_static(),
+    inner_pos(),
+    pos_integer(),
+    emqx_ds:time(),
+    _IsCurrent :: boolean()
 ) ->
-    {ok, Iter, [emqx_types:message()]} | {ok, end_of_stream} | {error, _}.
+    {ok, inner_pos(), [emqx_types:message()]} | {ok, end_of_stream} | {error, _}.
 
 -callback delete_next(
     dbshard(),
@@ -540,19 +551,23 @@ get_delete_streams(Shard, TopicFilter, StartTime) ->
         Gens
     ).
 
--spec make_iterator(dbshard(), stream(), emqx_ds:topic_filter(), emqx_ds:time()) ->
+-spec make_iterator(
+    emqx_ds:db(), emqx_ds:shard(), stream(), emqx_ds:topic_filter(), emqx_ds:time()
+) ->
     emqx_ds:make_iterator_result(iterator()).
 make_iterator(
-    Shard, ?stream_v2(GenId, Stream), TopicFilter, StartTime
+    DB, Shard, ?stream_v2(GenId, Stream), TopicFilter, StartTime
 ) ->
-    case generation_get(Shard, GenId) of
+    DBShard = {DB, Shard},
+    case generation_get(DBShard, GenId) of
         #{module := Mod, data := GenData} ->
-            case Mod:make_iterator(Shard, GenData, Stream, TopicFilter, StartTime) of
-                {ok, Iter} ->
-                    {ok, #{
-                        ?tag => ?IT,
-                        ?generation => GenId,
-                        ?enc => Iter
+            case Mod:make_iterator(DBShard, GenData, Stream, TopicFilter, StartTime) of
+                {ok, InnerStatic, InnerPos} ->
+                    {ok, #'Iterator'{
+                        shard = Shard,
+                        generation = GenId,
+                        innerStatic = InnerStatic,
+                        innerPos = InnerPos
                     }};
                 {error, _} = Err ->
                     Err
@@ -582,22 +597,19 @@ make_delete_iterator(
             {error, unrecoverable, generation_not_found}
     end.
 
--spec update_iterator(dbshard(), iterator(), emqx_ds:message_key()) ->
+-spec update_iterator(emqx_ds:db(), iterator(), emqx_ds:message_key()) ->
     emqx_ds:make_iterator_result(iterator()).
 update_iterator(
-    Shard,
-    #{?tag := ?IT, ?generation := GenId, ?enc := OldIter},
+    DB,
+    It = #'Iterator'{shard = Shard, generation = GenId, innerStatic = InnerStatic},
     DSKey
 ) ->
-    case generation_get(Shard, GenId) of
+    DBShard = {DB, Shard},
+    case generation_get(DBShard, GenId) of
         #{module := Mod, data := GenData} ->
-            case Mod:update_iterator(Shard, GenData, OldIter, DSKey) of
-                {ok, Iter} ->
-                    {ok, #{
-                        ?tag => ?IT,
-                        ?generation => GenId,
-                        ?enc => Iter
-                    }};
+            case Mod:update_iterator(DBShard, GenData, InnerStatic, DSKey) of
+                {ok, InnerPos} ->
+                    {ok, It#'Iterator'{innerPos = InnerPos}};
                 {error, Err} ->
                     {error, unrecoverable, Err}
             end;
@@ -606,18 +618,26 @@ update_iterator(
     end.
 
 -spec generation(iterator()) -> gen_id().
-generation(#{?tag := ?IT, ?generation := GenId}) ->
+generation(#'Iterator'{generation = GenId}) ->
     GenId.
 
--spec next(dbshard(), iterator(), pos_integer(), emqx_ds:time()) ->
+-spec next(emqx_ds:db(), iterator(), pos_integer(), emqx_ds:time()) ->
     emqx_ds:next_result(iterator()).
-next(Shard, Iter = #{?tag := ?IT, ?generation := GenId, ?enc := GenIter0}, BatchSize, Now) ->
-    case generation_get(Shard, GenId) of
+next(
+    DB,
+    It = #'Iterator'{
+        shard = Shard, generation = GenId, innerStatic = InnerStatic, innerPos = InnerPos0
+    },
+    BatchSize,
+    Now
+) ->
+    DBShard = {DB, Shard},
+    case generation_get(DBShard, GenId) of
         #{module := Mod, data := GenData} ->
             IsCurrent = GenId =:= generation_current(Shard),
-            case Mod:next(Shard, GenData, GenIter0, BatchSize, Now, IsCurrent) of
-                {ok, GenIter, Batch} ->
-                    {ok, Iter#{?enc := GenIter}, Batch};
+            case Mod:next(DBShard, GenData, InnerStatic, InnerPos0, BatchSize, Now, IsCurrent) of
+                {ok, InnerPos, Batch} ->
+                    {ok, It#'Iterator'{innerPos = InnerPos}, Batch};
                 {ok, end_of_stream} ->
                     {ok, end_of_stream};
                 Error = {error, _, _} ->
@@ -633,15 +653,20 @@ next(Shard, Iter = #{?tag := ?IT, ?generation := GenId, ?enc := GenIter0}, Batch
 
 %%    When doing multi-next, we group iterators by stream:
 %% @TODO we need add it to the callback
-unpack_iterator(DBShard = {_, Shard}, #{?tag := ?IT, ?generation := GenId, ?enc := Inner}) ->
+unpack_iterator(DB, #'Iterator'{
+    shard = Shard, generation = GenId, innerStatic = InnerStatic, innerPos = InnerPos
+}) ->
+    DBShard = {DB, Shard},
     case generation_get(DBShard, GenId) of
         #{module := Mod, data := GenData} ->
-            {InnerStream, TopicFilter, Key, _TS} = Mod:unpack_iterator(DBShard, GenData, Inner),
+            {InnerStream, TopicFilter, Key} = Mod:unpack_iterator(
+                DBShard, GenData, InnerStatic, InnerPos
+            ),
             #{
                 stream => ?stream_v2(GenId, InnerStream),
                 topic_filter => TopicFilter,
                 last_seen_key => Key,
-                message_matcher => Mod:message_matcher(DBShard, GenData, Inner),
+                message_matcher => Mod:message_matcher(DBShard, GenData, InnerStatic, InnerPos),
                 rank => {Shard, GenId}
             };
         not_found ->
@@ -653,31 +678,38 @@ unpack_iterator(DBShard = {_, Shard}, #{?tag := ?IT, ?generation := GenId, ?enc 
 %% the beamformer module, and it allows to fetch data for multiple
 %% iterators at once.
 scan_stream(
-    Shard, ?stream_v2(GenId, Inner), TopicFilter, Now, StartMsg, BatchSize
+    DBShard, ?stream_v2(GenId, Inner), TopicFilter, Now, StartMsg, BatchSize
 ) ->
-    case generation_get(Shard, GenId) of
+    case generation_get(DBShard, GenId) of
         #{module := Mod, data := GenData} ->
-            IsCurrent = GenId =:= generation_current(Shard),
+            IsCurrent = GenId =:= generation_current(DBShard),
             Mod:scan_stream(
-                Shard, GenData, Inner, TopicFilter, StartMsg, BatchSize, Now, IsCurrent
+                DBShard, GenData, Inner, TopicFilter, StartMsg, BatchSize, Now, IsCurrent
             );
         not_found ->
             ?ERR_GEN_GONE
     end.
 
-high_watermark(Shard, ?stream_v2(_, _) = Stream, Now) ->
-    case make_iterator(Shard, Stream, ['#'], Now) of
+high_watermark(DB, Shard, ?stream_v2(_, _) = Stream, Now) ->
+    case make_iterator(DB, Shard, Stream, ['#'], Now) of
         {ok, It} ->
-            #{last_seen_key := LSK} = unpack_iterator(Shard, It),
+            #{last_seen_key := LSK} = unpack_iterator(DB, It),
             {ok, LSK};
         Err ->
             Err
     end.
 
-fast_forward(Shard, It = #{?tag := ?IT, ?generation := GenId, ?enc := Inner0}, Key, Now) ->
-    case generation_get(Shard, GenId) of
+fast_forward(
+    DB,
+    It = #'Iterator'{
+        shard = Shard, generation = GenId, innerStatic = InnerStatic, innerPos = InnerPos
+    },
+    Key,
+    Now
+) ->
+    case generation_get({DB, Shard}, GenId) of
         #{module := Mod, data := GenData} ->
-            case Mod:fast_forward(Shard, GenData, Inner0, Key, Now) of
+            case Mod:fast_forward(Shard, GenData, InnerStatic, InnerPos, Key, Now) of
                 {ok, Inner} ->
                     {ok, It#{?enc := Inner}};
                 Other ->
@@ -695,10 +727,12 @@ message_match_context(Shard, ?stream_v2(GenId, Inner), MsgKey, Message) ->
             ?ERR_GEN_GONE
     end.
 
-iterator_match_context(Shard, #{?tag := ?IT, ?generation := GenId, ?enc := Inner}) ->
-    case generation_get(Shard, GenId) of
+iterator_match_context(DB, #'Iterator'{
+    shard = Shard, generation = GenId, innerStatic = InnerStatic, innerPos = InnerPos
+}) ->
+    case generation_get({DB, Shard}, GenId) of
         #{module := Mod, data := GenData} ->
-            Mod:iterator_match_context(Shard, GenData, Inner);
+            Mod:iterator_match_context(Shard, GenData, InnerStatic, InnerPos);
         not_found ->
             ?ERR_GEN_GONE
     end.

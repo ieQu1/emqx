@@ -28,11 +28,11 @@
     make_iterator/5,
     make_delete_iterator/5,
     update_iterator/4,
-    next/6,
+    next/7,
     delete_next/7,
     lookup_message/3,
 
-    unpack_iterator/3,
+    unpack_iterator/4,
     scan_stream/8,
     message_matcher/3,
     fast_forward/5,
@@ -43,7 +43,7 @@
 %% internal exports:
 -export([]).
 
--export_type([options/0]).
+-export_type([options/0, iterator_static/0, iterator_pos/0]).
 
 -include_lib("emqx_utils/include/emqx_message.hrl").
 
@@ -69,8 +69,7 @@
 
 -record(it, {
     topic_filter :: emqx_ds:topic_filter(),
-    start_time :: emqx_ds:time(),
-    last_seen_message_key = first :: binary() | first
+    start_time :: emqx_ds:time()
 }).
 
 -record(delete_it, {
@@ -78,6 +77,10 @@
     start_time :: emqx_ds:time(),
     last_seen_message_key = first :: binary() | first
 }).
+
+-type iterator_static() :: #it{}.
+
+-type iterator_pos() :: binary() | first.
 
 %%================================================================================
 %% API functions
@@ -147,40 +150,31 @@ make_delete_iterator(_Shard, _Data, #delete_stream{}, TopicFilter, StartTime) ->
         start_time = StartTime
     }}.
 
-update_iterator(_Shard, _Data, OldIter, DSKey) ->
-    #it{
-        topic_filter = TopicFilter,
-        start_time = StartTime
-    } = OldIter,
-    {ok, #it{
-        topic_filter = TopicFilter,
-        start_time = StartTime,
-        last_seen_message_key = DSKey
-    }}.
+update_iterator(_Shard, _Data, _OldIter, DSKey) ->
+    {ok, DSKey}.
 
 fast_forward(_ShardId, _S, It0, DSKey, _TMax) ->
     %% FIXME:
-    {ok, It0#it{last_seen_message_key = DSKey}}.
+    DSKey.
 
-next(_Shard, #s{db = DB, cf = CF}, It0, BatchSize, _Now, IsCurrent) ->
-    #it{topic_filter = TopicFilter, start_time = StartTime, last_seen_message_key = Key0} = It0,
+next(_DBShard, #s{db = DB, cf = CF}, ItStatic, ItPos0, BatchSize, _Now, IsCurrent) ->
+    #it{topic_filter = TopicFilter, start_time = StartTime} = ItStatic,
     {ok, ITHandle} = rocksdb:iterator(DB, CF, []),
     Action =
-        case Key0 of
+        case ItPos0 of
             first ->
                 first;
             _ ->
-                _ = rocksdb:iterator_move(ITHandle, Key0),
+                _ = rocksdb:iterator_move(ITHandle, ItPos0),
                 next
         end,
-    {Key, Messages} = do_next(TopicFilter, StartTime, ITHandle, Action, BatchSize, Key0, []),
+    {ItPos, Messages} = do_next(TopicFilter, StartTime, ITHandle, Action, BatchSize, ItPos0, []),
     rocksdb:iterator_close(ITHandle),
-    It = It0#it{last_seen_message_key = Key},
     case Messages of
         [] when not IsCurrent ->
             {ok, end_of_stream};
         _ ->
-            {ok, It, lists:reverse(Messages)}
+            {ok, ItPos, lists:reverse(Messages)}
     end.
 
 delete_next(_Shard, #s{db = DB, cf = CF}, It0, Selector, BatchSize, _Now, IsCurrent) ->
@@ -229,19 +223,15 @@ lookup_message(_ShardId, S = #s{db = DB, cf = CF}, #message_matcher{timestamp = 
             {error, unrecoverable, Reason}
     end.
 
-unpack_iterator(_Shard, _S, #it{topic_filter = TopicFilter, last_seen_message_key = LSK}) ->
+unpack_iterator(_Shard, _S, #it{topic_filter = TopicFilter}, LSK) ->
     Stream = #stream{},
-    case LSK of
-        first -> Timestamp = 0;
-        <<Timestamp:64>> -> ok
-    end,
-    {Stream, TopicFilter, LSK, Timestamp}.
+    {Stream, TopicFilter, LSK}.
 
-scan_stream(Shard, S, _Stream, TopicFilter, LastSeenKey, BatchSize, TMax, IsCurrent) ->
-    It0 = #it{topic_filter = TopicFilter, start_time = 0, last_seen_message_key = LastSeenKey},
-    case next(Shard, S, It0, BatchSize, TMax, IsCurrent) of
-        {ok, #it{last_seen_message_key = LSK}, Batch} ->
-            {ok, LSK, Batch};
+scan_stream(DBShard, S, _Stream, TopicFilter, LastSeenKey0, BatchSize, TMax, IsCurrent) ->
+    It0 = #it{topic_filter = TopicFilter, start_time = 0},
+    case next(DBShard, S, It0, LastSeenKey0, BatchSize, TMax, IsCurrent) of
+        {ok, LastSeenKey, Batch} ->
+            {ok, LastSeenKey, Batch};
         Other ->
             Other
     end.
@@ -254,19 +244,7 @@ message_matcher(_Shard, _S, #it{
     end.
 
 batch_events(_Shard, _, _Messages) ->
-    %% FIXME:
     [#stream{}].
-%% Topics = lists:foldl(
-%%     fun
-%%         ({_TS, #message{topic = Topic}}, Acc) ->
-%%             Acc#{Topic => 1};
-%%         ({delete, _Msg}, Acc) ->
-%%             Acc
-%%     end,
-%%     #{},
-%%     Messages
-%% ),
-%% [#stream{} || T <- maps:keys(Topics)].
 
 %%================================================================================
 %% Internal functions

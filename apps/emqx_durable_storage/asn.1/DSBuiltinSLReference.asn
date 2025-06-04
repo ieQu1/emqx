@@ -9,12 +9,12 @@ BEGIN
 
   Stream ::= NULL
 
-  IteratorStatic ::= SEQUENCE {
+  ItStatic ::= SEQUENCE {
     topicFilter TopicFilter,
     startTime INTEGER
   }
 
-  IteratorPos ::= SEQUENCE {
+  ItPos ::= SEQUENCE {
     pos OCTET STRING OPTIONAL
   }
 END
