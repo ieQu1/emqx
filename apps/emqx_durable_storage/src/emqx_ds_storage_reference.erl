@@ -34,7 +34,7 @@
 
     unpack_iterator/4,
     scan_stream/8,
-    message_matcher/3,
+    message_matcher/4,
     fast_forward/5,
 
     batch_events/3
@@ -139,10 +139,12 @@ get_delete_streams(_Shard, _Data, _TopicFilter, _StartTime) ->
     [#delete_stream{}].
 
 make_iterator(_Shard, _Data, #stream{}, TopicFilter, StartTime) ->
-    {ok, #it{
-        topic_filter = TopicFilter,
-        start_time = StartTime
-    }}.
+    {ok,
+        #it{
+            topic_filter = TopicFilter,
+            start_time = StartTime
+        },
+        first}.
 
 make_delete_iterator(_Shard, _Data, #delete_stream{}, TopicFilter, StartTime) ->
     {ok, #delete_it{
@@ -153,9 +155,9 @@ make_delete_iterator(_Shard, _Data, #delete_stream{}, TopicFilter, StartTime) ->
 update_iterator(_Shard, _Data, _OldIter, DSKey) ->
     {ok, DSKey}.
 
-fast_forward(_ShardId, _S, It0, DSKey, _TMax) ->
+fast_forward(_ShardId, _S, _It0, DSKey, _TMax) ->
     %% FIXME:
-    DSKey.
+    {ok, DSKey}.
 
 next(_DBShard, #s{db = DB, cf = CF}, ItStatic, ItPos0, BatchSize, _Now, IsCurrent) ->
     #it{topic_filter = TopicFilter, start_time = StartTime} = ItStatic,
@@ -236,10 +238,8 @@ scan_stream(DBShard, S, _Stream, TopicFilter, LastSeenKey0, BatchSize, TMax, IsC
             Other
     end.
 
-message_matcher(_Shard, _S, #it{
-    start_time = StartTime, topic_filter = TF
-}) ->
-    fun(LastSeenKey, MsgKey = <<TS:64>>, _TopicWords, #message{topic = Topic}) ->
+message_matcher(_DBShard, _S, #it{start_time = StartTime, topic_filter = TF}, LastSeenKey) ->
+    fun(MsgKey = <<TS:64>>, _TopicWords, #message{topic = Topic}) ->
         MsgKey > LastSeenKey andalso TS >= StartTime andalso emqx_topic:match(Topic, TF)
     end.
 

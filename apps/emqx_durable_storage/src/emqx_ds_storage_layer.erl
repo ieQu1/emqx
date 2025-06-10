@@ -21,7 +21,7 @@
 
     get_streams/3,
     get_delete_streams/3,
-    make_iterator/5,
+    make_iterator/4,
     make_delete_iterator/4,
     update_iterator/3,
     next/4,
@@ -31,7 +31,7 @@
     %% Beamformer
     unpack_iterator/2,
     scan_stream/6,
-    high_watermark/4,
+    high_watermark/3,
     fast_forward/4,
     message_match_context/4,
     iterator_match_context/2,
@@ -552,13 +552,12 @@ get_delete_streams(Shard, TopicFilter, StartTime) ->
     ).
 
 -spec make_iterator(
-    emqx_ds:db(), emqx_ds:shard(), stream(), emqx_ds:topic_filter(), emqx_ds:time()
+    dbshard(), stream(), emqx_ds:topic_filter(), emqx_ds:time()
 ) ->
     emqx_ds:make_iterator_result(iterator()).
 make_iterator(
-    DB, Shard, ?stream_v2(GenId, Stream), TopicFilter, StartTime
+    DBShard = {_, Shard}, ?stream_v2(GenId, Stream), TopicFilter, StartTime
 ) ->
-    DBShard = {DB, Shard},
     case generation_get(DBShard, GenId) of
         #{module := Mod, data := GenData} ->
             case Mod:make_iterator(DBShard, GenData, Stream, TopicFilter, StartTime) of
@@ -634,7 +633,7 @@ next(
     DBShard = {DB, Shard},
     case generation_get(DBShard, GenId) of
         #{module := Mod, data := GenData} ->
-            IsCurrent = GenId =:= generation_current(Shard),
+            IsCurrent = GenId =:= generation_current(DBShard),
             case Mod:next(DBShard, GenData, InnerStatic, InnerPos0, BatchSize, Now, IsCurrent) of
                 {ok, InnerPos, Batch} ->
                     {ok, It#'Iterator'{innerPos = InnerPos}, Batch};
@@ -690,8 +689,8 @@ scan_stream(
             ?ERR_GEN_GONE
     end.
 
-high_watermark(DB, Shard, ?stream_v2(_, _) = Stream, Now) ->
-    case make_iterator(DB, Shard, Stream, ['#'], Now) of
+high_watermark({DB, _} = DBShard, ?stream_v2(_, _) = Stream, Now) ->
+    case make_iterator(DBShard, Stream, ['#'], Now) of
         {ok, It} ->
             #{last_seen_key := LSK} = unpack_iterator(DB, It),
             {ok, LSK};
@@ -1405,8 +1404,8 @@ cf_handle(Name, CFRefs) ->
 %%--------------------------------------------------------------------------------
 
 -spec generation_current(dbshard()) -> gen_id().
-generation_current(Shard) ->
-    #{current_generation := Current} = get_schema_runtime(Shard),
+generation_current(DBShard) ->
+    #{current_generation := Current} = get_schema_runtime(DBShard),
     Current.
 
 %% TODO: remove me
