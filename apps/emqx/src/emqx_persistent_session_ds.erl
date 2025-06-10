@@ -749,7 +749,7 @@ replay(ClientInfo, [], Session0) ->
     },
     case Events of
         [] -> Session2 = Session1;
-        _ -> Session2 = commit(Session1)
+        _ -> Session2 = async_checkpoint(Session1)
     end,
     Session = replay_streams(Session2, ClientInfo),
     {ok, [], Session}.

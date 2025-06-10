@@ -358,9 +358,9 @@ guard(ClientId, Shard, Generation) ->
     emqx_persistent_session_ds_state:guard() | undefined
 ) -> ok.
 assert_guard(ClientId, undefined) ->
-    emqx_ds:tx_kv_assert_absent([?top_guard, ClientId]);
+    emqx_ds:tx_ttv_assert_absent([?top_guard, ClientId], 0);
 assert_guard(ClientId, Guard) when is_binary(Guard) ->
-    emqx_ds:tx_kv_assert_present([?top_guard, ClientId], Guard).
+    emqx_ds:tx_ttv_assert_present([?top_guard, ClientId], 0, Guard).
 
 -spec write_guard(emqx_persistent_session_ds:id(), binary() | ?ds_tx_serial) -> ok.
 write_guard(ClientId, Guard) ->
@@ -426,9 +426,12 @@ pmap_delete(ClientId, Name) when is_atom(Name) ->
 %% @doc Write a single key-value pair that belongs to a pmap:
 -spec write_pmap_kv(atom(), emqx_persistent_session_ds:id(), _, _) -> emqx_ds:kv_pair().
 write_pmap_kv(Name, ClientId, Key, Val) ->
-    emqx_ds:tx_kv_write(
-        pmap_topic(Name, ClientId, Key, Val),
-        ser_payload(Name, Key, Val)
+    emqx_ds:tx_write(
+        {
+            pmap_topic(Name, ClientId, Key, Val),
+            0,
+            ser_payload(Name, Key, Val)
+        }
     ).
 
 %% @doc Deserialize a single key-value pair that belongs to a pmap:
