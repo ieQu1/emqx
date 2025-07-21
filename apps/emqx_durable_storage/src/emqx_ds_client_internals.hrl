@@ -14,7 +14,8 @@
 -record(ds_sub, {
     id :: emqx_ds_client:sub_id(),
     handle :: emqx_ds:subscription_handle(),
-    stream :: emqx_ds:stream()
+    stream :: emqx_ds:stream(),
+    db :: emqx_ds:db()
 }).
 
 -record(stream_cache, {
@@ -90,5 +91,15 @@
     db :: emqx_ds:db(),
     handle :: emqx_ds:subscription_handle()
 }).
+
+-define(record_to_map(RECORD, VALUE),
+    (fun(Val) ->
+        Fields = record_info(fields, RECORD),
+        [_Tag | Values] = tuple_to_list(Val),
+        maps:from_list(lists:zip(Fields, Values))
+    end)(
+        VALUE
+    )
+).
 
 -endif.

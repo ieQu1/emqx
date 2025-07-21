@@ -14,7 +14,7 @@ a host process that handles the business logic.
 """.
 
 %% API:
--export([new/2, destroy/2, subscribe/3, unsubscribe/3, dispatch_message/3]).
+-export([new/2, destroy/2, subscribe/3, unsubscribe/3, dispatch_message/3, inspect/1]).
 
 -export_type([sub_id/0, t/0, sub_options/0]).
 
@@ -87,7 +87,9 @@ Global state of the client. It encapsulatees states of all active subscriptions.
     HostState.
 
 -callback get_iterator(sub_id(), emqx_ds:slab(), emqx_ds:stream(), _HostState) ->
-    {ok, emqx_ds:iterator() | end_of_stream} | undefined.
+    {ok, emqx_ds:iterator() | end_of_stream}
+    | {subscribe, emqx_ds:iterator()}
+    | undefined.
 
 -callback del_iterator(sub_id(), eqmqx_ds:slab(), emqx_ds:stream(), HostState) -> HostState.
 
@@ -114,27 +116,27 @@ new(CBM, UserOpts) ->
     #cs{cbm = CBM, options = Options}.
 
 -spec destroy(t(), HostState) -> HostState.
-destroy(GS, HostState0) ->
-    {_, _, HostState} = execute(destroy_(GS), HostState0),
+destroy(CS, HostState0) ->
+    {_, _, HostState} = execute(destroy_(CS), HostState0),
     HostState.
 
 -spec subscribe(t(), sub_options(), HostState) ->
     {ok, t(), HostState} | {error, badarg | already_exists}.
-subscribe(GS0, UserOpts = #{id := _, db := _, topic := _}, HostState0) ->
-    case subscribe_(GS0, UserOpts, HostState0) of
-        {ok, GS1} ->
-            {GS, HostState} = execute(GS1, HostState0),
-            {ok, GS, HostState};
+subscribe(CS0, UserOpts = #{id := _, db := _, topic := _}, HostState0) ->
+    case subscribe_(CS0, UserOpts, HostState0) of
+        {ok, CS1} ->
+            {CS, HostState} = execute(CS1, HostState0),
+            {ok, CS, HostState};
         Error ->
             Error
     end.
 
 -spec unsubscribe(t(), sub_id(), HostState) -> {ok, t(), HostState} | {error, not_found}.
-unsubscribe(GS0, SubId, HostState0) ->
-    case unsubscribe_(GS0, SubId, HostState0) of
-        {ok, GS1, HostState1} ->
-            {GS, HostState} = execute(GS1, HostState1),
-            {ok, GS, HostState};
+unsubscribe(CS0, SubId, HostState0) ->
+    case unsubscribe_(CS0, SubId, HostState0) of
+        {ok, CS1, HostState1} ->
+            {CS, HostState} = execute(CS1, HostState1),
+            {ok, CS, HostState};
         Error ->
             Error
     end.
@@ -146,18 +148,25 @@ If atom `ignore` is returned, the message was not addressed to the client and sh
 """.
 -spec dispatch_message(t(), term(), HostState) ->
     ignore | {t(), HostState} | {data, sub_id(), #ds_sub_reply{}}.
-dispatch_message(GS0, Message, HostState0) ->
+dispatch_message(CS0, Message, HostState0) ->
     Result = dispatch_message(
-        fun real_world/2, undefined, fun result_handler/4, GS0, Message, HostState0
+        fun real_world/2, undefined, fun result_handler/4, CS0, Message, HostState0
     ),
     case Result of
         {data, SubId, Data, _EffHandlerState} ->
             {data, SubId, Data};
-        {_EffHandlerState, GS, HostState} ->
-            {GS, HostState};
+        {_EffHandlerState, CS, HostState} ->
+            {CS, HostState};
         ignore ->
             ignore
     end.
+
+-spec inspect(t()) -> map().
+inspect(CS = #cs{streams = Streams, ds_subs = DSSubs}) ->
+    ?record_to_map(cs, CS#cs{
+        streams = maps:map(fun(_, V) -> ?record_to_map(stream_cache, V) end, Streams),
+        ds_subs = maps:map(fun(_, V) -> ?record_to_map(ds_sub, V) end, DSSubs)
+    }).
 
 %%================================================================================
 %% Internal functions
@@ -181,31 +190,32 @@ dispatch_message(
     EffHandler,
     EffHandlerState,
     ResultHandler,
-    GS = #cs{ref = Ref, retry_tref = TRef},
+    CS = #cs{ref = Ref, retry_tref = TRef},
     #emqx_ds_client_retry{ref = Ref},
     HostState
 ) when is_reference(TRef) ->
+    %% io:format(user, "Retry ~p~n", [CS#cs.retry]),
     execute(
         #cs.retry,
         EffHandler,
         EffHandlerState,
         ResultHandler,
-        GS#cs{retry_tref = undefined},
+        CS#cs{retry_tref = undefined},
         HostState
     );
 dispatch_message(
     EffHandler,
     EffHandlerState,
     ResHandler,
-    GS0 = #cs{new_streams_watches = Watches, subs = Subs},
+    CS0 = #cs{new_streams_watches = Watches, subs = Subs},
     #new_stream_event{subref = Watch},
     HostState
 ) ->
     case Watches of
         #{Watch := SubId} ->
             #{SubId := Sub} = Subs,
-            GS = renew_streams_(GS0, SubId, Sub, HostState),
-            execute(#cs.plan, EffHandler, EffHandlerState, ResHandler, GS, HostState);
+            CS = renew_streams_(CS0, SubId, Sub, HostState),
+            execute(#cs.plan, EffHandler, EffHandlerState, ResHandler, CS, HostState);
         #{} ->
             ignore
     end;
@@ -213,24 +223,24 @@ dispatch_message(_, _, _, _, _, _) ->
     ignore.
 
 -spec destroy_(t()) -> t().
-destroy_(GS0 = #cs{retry_tref = TRef}) ->
+destroy_(CS0 = #cs{retry_tref = TRef}) ->
     %% Cancel retry timer:
     _ = is_reference(TRef) andalso erlang:cancel_timer(TRef),
     %% Drop all pending effects:
-    GS = GS0#cs{
+    CS = CS0#cs{
         retry_tref = undefined,
         plan = [],
         retry = []
     },
     %% Free all subscriptions:
-    release_objects_(undefined, GS).
+    release_objects_(undefined, CS).
 
 %% Schedule release of subscriptions and watches owned by `RelSubId'
 %% or release everything when `RelSubId' = `undefined':
 -spec release_objects_(sub_id() | undefined, t()) -> t().
-release_objects_(RelSubId, GS0 = #cs{subs = Subs, new_streams_watches = Watches, ds_subs = DSSubs}) ->
+release_objects_(RelSubId, CS0 = #cs{subs = Subs, new_streams_watches = Watches, ds_subs = DSSubs}) ->
     %% Remove watches:
-    GS = maps:fold(
+    CS = maps:fold(
         fun
             (Watch, SubId, Acc) when
                 SubId =:= RelSubId; RelSubId =:= undefined
@@ -240,7 +250,7 @@ release_objects_(RelSubId, GS0 = #cs{subs = Subs, new_streams_watches = Watches,
             (_, _, Acc) ->
                 Acc
         end,
-        GS0,
+        CS0,
         Watches
     ),
     %% Remove subscriptions:
@@ -254,14 +264,14 @@ release_objects_(RelSubId, GS0 = #cs{subs = Subs, new_streams_watches = Watches,
             (_, _, Acc) ->
                 Acc
         end,
-        GS,
+        CS,
         DSSubs
     ).
 
 -spec subscribe_(t(), sub_options(), _HostState) -> {ok, t()} | {error, badarg | already_exists}.
 subscribe_(_, #{id := undefined}, _) ->
     {error, badarg};
-subscribe_(GS0 = #cs{subs = Subs0}, UserOpts = #{id := SubId, db := DB, topic := Topic}, HostState) ->
+subscribe_(CS0 = #cs{subs = Subs0}, UserOpts = #{id := SubId, db := DB, topic := Topic}, HostState) ->
     %% Check uniqueness of the subscription id:
     case Subs0 of
         #{SubId := _} ->
@@ -277,48 +287,39 @@ subscribe_(GS0 = #cs{subs = Subs0}, UserOpts = #{id := SubId, db := DB, topic :=
                 start_time = StartTime,
                 ds_sub_opts = DSSubOpts
             },
-            GS1 = GS0#cs{subs = Subs0#{SubId => Sub}},
-            %% Plan subscription to the stream events followed by stream renewal:
-            GS = plan(#eff_watch_streams{sub_id = SubId, db = DB, topic = Topic}, GS1),
-            {ok, renew_streams_(GS, SubId, Sub, HostState)}
+            CS1 = CS0#cs{subs = Subs0#{SubId => Sub}},
+            CS = watch_streams_(CS1, SubId, Sub, HostState),
+            {ok, CS}
     end.
 
 -spec unsubscribe_(t(), sub_id(), HostState) -> {ok, t(), HostState} | {error, not_found}.
-unsubscribe_(GS0 = #cs{subs = Subs0, new_streams_watches = Watches}, SubId, HostState) ->
+unsubscribe_(
+    CS0 = #cs{subs = Subs0, new_streams_watches = Watches, streams = Streams0}, SubId, HostState
+) ->
     case maps:take(SubId, Subs0) of
-        {#sub{db = DB}, Subs} ->
-            %% 1. Remove subscription from the registered list:
-            GS1 = GS0#cs{subs = Subs},
-            %% 2. Remove all previously scheduled events that belong to the subscription:
-            GS2 = filter_effects(fun(Eff) -> eff_subid(Eff) =/= SubId end, GS1),
-            %% 3. Remove new stream watch if exists:
-            GS3 =
-                case emqx_utils_maps:find_key(SubId, Watches) of
-                    {ok, Watch} ->
-                        plan(#eff_unwatch_streams{db = DB, watch = Watch}, GS2);
-                    undefined ->
-                        GS2
+        {Sub = #sub{}, Subs} ->
+            %% 1. Remove all previously scheduled non-destructive
+            %% events previously scheduled by the subscription:
+            CS1 = filter_effects(
+                fun(Eff) ->
+                    eff_subid(Eff) =/= SubId orelse eff_destructive(Eff)
                 end,
-            %% 4. Remove all DS subscriptions that belong to this SubId:
-            GS = maps:fold(
-                fun
-                    (SubRef, #ds_sub{id = Id, handle = Handle}, Acc) when Id =:= SubId ->
-                        plan(#eff_ds_unsub{ref = SubRef, db = DB, handle = Handle}, Acc);
-                    (_SubRef, #ds_sub{}, Acc) ->
-                        Acc
-                end,
-                GS3,
-                GS3#cs.ds_subs
+                CS0
             ),
-            %% 5. Remove all streams that belong to this SubId:
-            {ok, GS, HostState};
+            %% 2. Remove new stream watch if exists:
+            CS2 = unwatch_streams_(CS1, SubId, Sub),
+            %% 3. Remove all streams:
+            CS3 = streams_destroy_(CS2, SubId),
+            %% 4. Remove subscription from the registered set:
+            CS = CS3#cs{subs = Subs},
+            {ok, CS, HostState};
         error ->
             {error, not_found}
     end.
 
 -spec renew_streams_(t(), sub_id(), sub(), _HostState) -> t().
 renew_streams_(
-    GS = #cs{cbm = CBM},
+    CS = #cs{cbm = CBM},
     SubId,
     #sub{
         db = DB,
@@ -342,7 +343,7 @@ renew_streams_(
                 Acc
             )
         end,
-        GS,
+        CS,
         emqx_ds:list_shards(DB)
     ).
 
@@ -353,84 +354,84 @@ renew_streams_(
 -spec result_handler(effect(), t(), _Result, HostState) -> {t(), HostState}.
 result_handler(
     #eff_watch_streams{sub_id = SubId},
-    GS0 = #cs{new_streams_watches = Watches},
+    CS0 = #cs{new_streams_watches = Watches},
     HostState,
     Watch
 ) ->
-    GS = GS0#cs{new_streams_watches = Watches#{Watch => SubId}},
-    {GS, HostState};
+    CS = CS0#cs{new_streams_watches = Watches#{Watch => SubId}},
+    {CS, HostState};
 result_handler(
     #eff_unwatch_streams{watch = Watch},
-    GS0 = #cs{new_streams_watches = Watches},
+    CS0 = #cs{new_streams_watches = Watches},
     HostState,
     _Result
 ) ->
-    GS = GS0#cs{new_streams_watches = maps:remove(Watch, Watches)},
-    {GS, HostState};
+    CS = CS0#cs{new_streams_watches = maps:remove(Watch, Watches)},
+    {CS, HostState};
 result_handler(
     Eff = #eff_renew_streams{sub_id = SubId, shard = Shard},
-    GS,
+    CS,
     HostState,
     {Streams, Errors}
 ) ->
     case Errors of
         [] ->
-            update_streams(GS, SubId, Shard, Streams, HostState);
+            update_streams(CS, SubId, Shard, Streams, HostState);
         _ ->
             {
-                retry(Errors, Eff, GS),
+                retry(Errors, Eff, CS),
                 HostState
             }
     end;
-result_handler(Eff = #eff_make_iterator{}, GS0, HostState0, Result) ->
+result_handler(Eff = #eff_make_iterator{}, CS0, HostState0, Result) ->
     case Result of
         {ok, It} ->
-            handle_add_iterator(Eff, GS0, HostState0, It);
+            handle_add_iterator(Eff, CS0, HostState0, It);
         ?err_rec(Err) ->
             {
-                retry(Err, Eff, GS0),
+                retry(Err, Eff, CS0),
                 HostState0
             };
         ?err_unrec(Err) ->
-            handle_make_iterator_fail(Eff, GS0, HostState0, Err)
+            handle_make_iterator_fail(Eff, CS0, HostState0, Err)
     end;
-result_handler(Eff = #eff_ds_sub{}, GS, HostState, Result) ->
+result_handler(Eff = #eff_ds_sub{}, CS, HostState, Result) ->
     case Result of
         {ok, Handle, SubRef} ->
             {
-                handle_new_sub(Eff, GS, Handle, SubRef),
+                handle_new_ds_sub(Eff, CS, Handle, SubRef),
                 HostState
             };
         ?err_rec(Err) ->
             {
-                retry(Err, Eff, GS),
+                retry(Err, Eff, CS),
                 HostState
             }
     end;
-result_handler(#eff_ds_unsub{ref = Ref}, GS, HostState, _Result) ->
-    #cs{ds_subs = DSSubs} = GS,
+result_handler(#eff_ds_unsub{ref = Ref}, CS, HostState, _Result) ->
+    #cs{ds_subs = DSSubs} = CS,
     {
-        GS#cs{ds_subs = maps:remove(Ref, DSSubs)},
+        CS#cs{ds_subs = maps:remove(Ref, DSSubs)},
         HostState
     }.
 
-handle_new_sub(Eff, GS0, Handle, SubRef) ->
+handle_new_ds_sub(Eff, CS0, Handle, SubRef) ->
     #eff_ds_sub{sub_id = SubId, db = DB, slab = Slab, stream = Stream, iterator = It} = Eff,
-    GS = #cs{ds_subs = DSSubs} = activate_stream(GS0, SubId, Slab, Stream, It, SubRef),
+    CS = #cs{ds_subs = DSSubs} = activate_stream(CS0, SubId, Slab, Stream, It, SubRef),
     DSSub = #ds_sub{
         id = SubId,
         handle = Handle,
-        stream = Stream
+        stream = Stream,
+        db = DB
     },
-    GS#cs{
+    CS#cs{
         ds_subs = DSSubs#{SubRef => DSSub}
     }.
 
-handle_add_iterator(Eff, GS0, HostState0, It) ->
-    #cs{cbm = CBM, subs = Subs} = GS0,
+handle_add_iterator(Eff, CS0, HostState0, It) ->
+    #cs{cbm = CBM, subs = Subs} = CS0,
     #eff_make_iterator{sub_id = SubId, db = DB, slab = Slab, stream = Stream} = Eff,
-    %% FIXME: add stram to active
-    GS = activate_stream(GS0, SubId, Slab, Stream, It, undefined),
+    CS = activate_stream(CS0, SubId, Slab, Stream, It, undefined),
     case on_new_iterator(CBM, SubId, Slab, Stream, It, HostState0) of
         {subscribe, HostState} ->
             #{SubId := #sub{ds_sub_opts = SubOpts}} = Subs,
@@ -444,13 +445,13 @@ handle_add_iterator(Eff, GS0, HostState0, It) ->
                         iterator = It,
                         sub_options = SubOpts
                     },
-                    GS
+                    CS
                 ),
                 HostState
             };
         {ignore, HostState} ->
             {
-                GS,
+                CS,
                 HostState
             }
     end.
@@ -458,7 +459,7 @@ handle_add_iterator(Eff, GS0, HostState0, It) ->
 -doc """
 Handle unrecoverable errors that happen during creation of iterators.
 """.
-handle_make_iterator_fail(Eff, GS = #cs{cbm = CBM}, HostState, Err) ->
+handle_make_iterator_fail(Eff, CS = #cs{cbm = CBM}, HostState, Err) ->
     #eff_make_iterator{
         sub_id = SubId, db = DB, slab = Slab, stream = Stream, topic = Topic, start_time = StartTime
     } = Eff,
@@ -472,7 +473,7 @@ handle_make_iterator_fail(Eff, GS = #cs{cbm = CBM}, HostState, Err) ->
         start_time => StartTime
     }),
     {
-        forget_stream(GS, SubId, Slab, Stream),
+        forget_stream(CS, SubId, Slab, Stream),
         on_make_iterator_fail(CBM, SubId, Slab, Stream, Err, HostState)
     }.
 
@@ -512,78 +513,76 @@ real_world(#eff_make_iterator{db = DB, stream = Stream, topic = TF, start_time =
     emqx_ds:sub_ref() | undefined
 ) ->
     t().
-activate_stream(GS = #cs{streams = Streams}, SubId, {Shard, _Gen}, Stream, Iterator, MaybeSubRef) ->
-    Key = {SubId, Shard},
-    #{Key := Cache0} = Streams,
-    #stream_cache{pending_iterator = Pending, active = Active} = Cache0,
-    Cache = Cache0#stream_cache{
-        pending_iterator = Pending -- [Stream],
-        active = Active#{stream => {Iterator, MaybeSubRef}}
-    },
-    GS#cs{streams = Streams#{Key => Cache}}.
+activate_stream(CS, SubId, {Shard, _Gen}, Stream, Iterator, MaybeSubRef) ->
+    with_stream_cache(
+        SubId,
+        Shard,
+        CS,
+        fun(#stream_cache{pending_iterator = Pending, active = Active} = Cache) ->
+            Cache#stream_cache{
+                pending_iterator = Pending -- [Stream],
+                active = Active#{Stream => {Iterator, MaybeSubRef}}
+            }
+        end
+    ).
 
 -spec forget_stream(t(), sub_id(), emqx_ds:slab(), emqx_ds:stream()) -> t().
-forget_stream(GS = #cs{streams = Streams}, SubId, {Shard, Gen}, Stream) ->
-    Key = {SubId, Shard},
-    case Streams of
-        #{Key := Cache0} ->
-            #stream_cache{
-                pending_iterator = Pending, active = Active, replayed = Replayed, future = Future
-            } = Cache0,
-            Cache = Cache0#stream_cache{
-                pending_iterator = Pending -- [Stream],
-                active = maps:remove(Stream, Active),
-                replayed = maps:remove(Stream, Replayed),
-                future = gb_sets:delete({Gen, Stream}, Future)
-            },
-            GS#cs{streams = Streams#{Key => Cache}};
-        #{} ->
-            GS
-    end.
+forget_stream(CS, SubId, {Shard, Gen}, Stream) ->
+    with_stream_cache(
+        SubId,
+        Shard,
+        CS,
+        fun
+            (undefined) ->
+                undefined;
+            (
+                #stream_cache{
+                    pending_iterator = Pending,
+                    active = Active,
+                    replayed = Replayed,
+                    future = Future
+                } = Cache
+            ) ->
+                Cache#stream_cache{
+                    pending_iterator = Pending -- [Stream],
+                    active = maps:remove(Stream, Active),
+                    replayed = maps:remove(Stream, Replayed),
+                    future = gb_sets:delete({Gen, Stream}, Future)
+                }
+        end
+    ).
 
 -spec update_streams(
     t(), sub_id(), emqx_ds:shard(), [{emqx_ds:slab(), emqx_ds:stream()}], HostState
 ) ->
     {t(), HostState}.
-update_streams(GS0 = #cs{cbm = CBM, streams = Streams0}, SubId, Shard, Streams, HostState) ->
-    Key = {SubId, Shard},
-    %% Get the existing cache of create an initialize the empty record:
-    case Streams0 of
-        #{Key := StreamCache0} ->
-            ok;
-        #{} ->
-            StreamCache0 = #stream_cache{
-                current_gen = get_current_generation(CBM, SubId, Shard, HostState)
-            }
-    end,
-    %% Update the cache:
-    {GS1, StreamCache} = do_update_streams(
-        GS0,
-        HostState,
+update_streams(CS0, SubId, Shard, Streams, HostState0) ->
+    with_stream_cache(
         SubId,
         Shard,
-        StreamCache0,
-        Streams
-    ),
-    GS2 = GS1#cs{streams = Streams0#{Key => StreamCache}},
-    %% Should we advance some generations?
-    maybe_advance_generations(GS2, HostState).
+        CS0,
+        HostState0,
+        fun(Cache0) ->
+            {CS, Cache} = do_update_streams(CS0, HostState0, SubId, Shard, Cache0, Streams),
+            maybe_advance_generation(SubId, Shard, Cache, CS, HostState0)
+        end
+    ).
 
 -spec do_update_streams(t(), _HostState, sub_id(), emqx_ds:shard(), stream_cache(), [
     {emqx_ds:slab(), emqx_ds:stream()}
 ]) ->
     stream_cache().
-do_update_streams(GS0, HostState, SubId, Shard, Cache0, Streams) ->
+do_update_streams(CS0, HostState, SubId, Shard, Cache0, Streams) ->
     lists:foldl(
-        fun({{_Shard, Generation}, Stream}, {AccGS, AccCache}) ->
-            add_stream_to_cache(AccGS, HostState, SubId, Shard, AccCache, Generation, Stream)
+        fun({{_Shard, Generation}, Stream}, {AccCS, AccCache}) ->
+            add_stream_to_cache(AccCS, HostState, SubId, Shard, AccCache, Generation, Stream)
         end,
-        {GS0, Cache0},
+        {CS0, Cache0},
         Streams
     ).
 
 add_stream_to_cache(
-    GS,
+    CS,
     _HostState,
     _SubId,
     _Shard,
@@ -593,11 +592,11 @@ add_stream_to_cache(
 ) when Generation < Current ->
     %% Should not happen:
     {
-        GS,
+        CS,
         Cache
     };
 add_stream_to_cache(
-    GS,
+    CS,
     _HostState,
     _SubId,
     _Shard,
@@ -608,11 +607,11 @@ add_stream_to_cache(
     %% This is a stream we'll replay in the future:
     Future = gb_sets:add_element({Generation, Stream}, Future0),
     {
-        GS,
+        CS,
         Cache#stream_cache{future = Future}
     };
 add_stream_to_cache(
-    GS0, HostState, SubId, Shard, Cache0 = #stream_cache{current_gen = Current}, Generation, Stream
+    CS0, HostState, SubId, Shard, Cache0 = #stream_cache{current_gen = Current}, Generation, Stream
 ) when Generation =:= Current ->
     #stream_cache{
         pending_iterator = Pending,
@@ -628,38 +627,23 @@ add_stream_to_cache(
     of
         true ->
             %% This stream is already known:
-            {GS0, Cache0};
+            {CS0, Cache0};
         false ->
-            %% This stream is new (for us). Does the host already have the iterator?
-            case get_iterator(GS0#cs.cbm, SubId, {Shard, Generation}, Stream, HostState) of
+            %% This stream is new (for the client)
+            ?tp(debug, emqx_ds_client_new_stream, #{sub => SubId, shard => Shard, stream => Stream}),
+            %% Does the host already have the iterator?
+            case get_iterator(CS0#cs.cbm, SubId, {Shard, Generation}, Stream, HostState) of
                 {ok, end_of_stream} ->
                     %% This is a known replayed stream:
                     Cache = Cache0#stream_cache{replayed = Replayed#{Stream => true}},
-                    {GS0, Cache};
-                {ok, It} ->
-                    %% This is a known in-progress stream:
-                    #sub{db = DB, ds_sub_opts = DSSubOpts} = maps:get(
-                        SubId, GS0#cs.subs
-                    ),
-                    Cache = Cache0#stream_cache{active = Active#{Stream => {It, undefined}}},
-                    GS = plan(
-                        #eff_ds_sub{
-                            sub_id = SubId,
-                            db = DB,
-                            slab = {Shard, Generation},
-                            stream = Stream,
-                            iterator = It,
-                            sub_options = DSSubOpts
-                        },
-                        GS0
-                    ),
-                    {GS, Cache};
+                    {CS0, Cache};
                 undefined ->
-                    %% Schedule creation of the iterator:
+                    %% This stream is new to the host. Schedule
+                    %% creation of the iterator:
                     #sub{db = DB, topic = Topic, start_time = StartTime} = maps:get(
-                        SubId, GS0#cs.subs
+                        SubId, CS0#cs.subs
                     ),
-                    GS = plan(
+                    CS = plan(
                         #eff_make_iterator{
                             sub_id = SubId,
                             db = DB,
@@ -668,30 +652,47 @@ add_stream_to_cache(
                             topic = Topic,
                             start_time = StartTime
                         },
-                        GS0
+                        CS0
                     ),
                     Cache = Cache0#stream_cache{pending_iterator = [Stream | Pending]},
-                    {GS, Cache}
+                    {CS, Cache};
+                {Action, It} when Action =:= ok; Action =:= subscribe ->
+                    %% This is a known in-progress stream:
+                    #sub{db = DB, ds_sub_opts = DSSubOpts} = maps:get(
+                        SubId, CS0#cs.subs
+                    ),
+                    Cache = Cache0#stream_cache{active = Active#{Stream => {It, undefined}}},
+                    CS =
+                        case Action of
+                            ok ->
+                                %% Host doesn't want to subscribe:
+                                CS0;
+                            subscribe ->
+                                plan(
+                                    #eff_ds_sub{
+                                        sub_id = SubId,
+                                        db = DB,
+                                        slab = {Shard, Generation},
+                                        stream = Stream,
+                                        iterator = It,
+                                        sub_options = DSSubOpts
+                                    },
+                                    CS0
+                                )
+                        end,
+                    {CS, Cache}
             end
     end.
 
-maybe_advance_generations(GS0, HostState) ->
-    maps:fold(
-        fun(Key, Cache0, {GSAcc, HSAcc}) ->
-            maybe_advance_generation(Key, Cache0, GSAcc, HSAcc)
-        end,
-        {GS0, HostState},
-        GS0#cs.streams
-    ).
-
 maybe_advance_generation(
-    Key = {SubId, Shard}, Cache0, GS0 = #cs{cbm = CBM, streams = Streams, subs = Subs}, HostState0
+    SubId, Shard, Cache0, CS0 = #cs{cbm = CBM, streams = Streams, subs = Subs}, HostState0
 ) ->
     case is_fully_replayed(Cache0) of
         false ->
             %% Generation is not fully replayed:
-            {GS0, HostState0};
+            {Cache0, CS0, HostState0};
         {true, NextGen, StreamsOfNextGen, Future} ->
+            ?tp(debug, emqx_ds_client_advance_generation, #{next_gen => NextGen}),
             %% Advance generation:
             #{SubId := #sub{db = DB, topic = Topic, start_time = StartTime}} = Subs,
             %% Here we don't ask the host if it has the iterator: it
@@ -702,8 +703,8 @@ maybe_advance_generation(
                 future = Future
             },
             %% Schedule creation of iterators for the new streams:
-            GS2 = lists:foldl(
-                fun(Stream, GS1) ->
+            CS = lists:foldl(
+                fun(Stream, CS1) ->
                     plan(
                         #eff_make_iterator{
                             sub_id = SubId,
@@ -713,15 +714,14 @@ maybe_advance_generation(
                             topic = Topic,
                             start_time = StartTime
                         },
-                        GS1
+                        CS1
                     )
                 end,
-                GS0,
+                CS0,
                 StreamsOfNextGen
             ),
-            GS = GS2#cs{streams = Streams#{Key := Cache}},
             HostState = on_advance_generation(CBM, SubId, Shard, NextGen, HostState0),
-            {GS, HostState}
+            {Cache, CS, HostState}
     end.
 
 -spec is_fully_replayed(stream_cache()) ->
@@ -769,38 +769,46 @@ pop_future_streams(Current, NextGen, Future0, Acc) ->
 %%------------------------------------------------------------------------------
 
 -spec plan(effect(), t()) -> t().
-plan(Effect, GS = #cs{plan = Plan}) ->
-    GS#cs{plan = [Effect | Plan]}.
+plan(Effect, CS = #cs{plan = Plan}) ->
+    CS#cs{plan = [Effect | Plan]}.
 
 -doc """
 A wrapper of `retry/2` that prints a message before adding effect to the retry queue.
 """.
 -spec retry(_Reason, effect(), t()) -> t().
-retry(Reason, Effect, GS) ->
+retry(Reason, Effect, CS) ->
     ?tp(info, emqx_ds_client_retry, #{action => Effect, reason => Reason}),
-    retry(Effect, GS).
+    retry(Effect, CS).
 
 -spec retry(effect(), t()) -> t().
-retry(Effect, GS0 = #cs{retry = Retry, ref = Ref, options = #{retry_interval := RetryInterval}}) ->
-    GS = GS0#cs{retry = [Effect | Retry]},
-    case GS0#cs.retry_tref of
+retry(Effect, CS0 = #cs{retry = Retry, ref = Ref, options = #{retry_interval := RetryInterval}}) ->
+    CS = CS0#cs{retry = [Effect | Retry]},
+    %% Start timer if not running:
+    case CS0#cs.retry_tref of
         undefined ->
             TRef = erlang:send_after(RetryInterval, self(), #emqx_ds_client_retry{ref = Ref}),
-            GS#cs{retry_tref = TRef};
+            CS#cs{retry_tref = TRef};
         TRef when is_reference(TRef) ->
-            GS
+            CS
     end.
 
 -spec eff_subid(effect()) -> sub_id() | undefined.
-eff_subid(#eff_renew_streams{sub_id = SubId}) -> SubId;
 eff_subid(#eff_watch_streams{sub_id = SubId}) -> SubId;
 eff_subid(#eff_unwatch_streams{}) -> undefined;
+eff_subid(#eff_renew_streams{sub_id = SubId}) -> SubId;
+eff_subid(#eff_make_iterator{sub_id = SubId}) -> SubId;
 eff_subid(#eff_ds_sub{sub_id = SubId}) -> SubId;
 eff_subid(#eff_ds_unsub{}) -> undefined.
 
+-doc "Return true if the effect destroys an entity.".
+-spec eff_destructive(effect()) -> boolean().
+eff_destructive(#eff_unwatch_streams{}) -> true;
+eff_destructive(#eff_ds_unsub{}) -> true;
+eff_destructive(_) -> false.
+
 -spec filter_effects(fun((effect()) -> boolean()), t()) -> t().
-filter_effects(Pred, GS = #cs{plan = Plan, retry = Retry}) ->
-    GS#cs{plan = lists:filter(Pred, Plan), retry = lists:filter(Pred, Retry)}.
+filter_effects(Pred, CS = #cs{plan = Plan, retry = Retry}) ->
+    CS#cs{plan = lists:filter(Pred, Plan), retry = lists:filter(Pred, Retry)}.
 
 %%------------------------------------------------------------------------------
 %% The interpreter:
@@ -855,36 +863,44 @@ The good news is that the last one is only used for testing.
 """.
 
 -spec execute(t(), HostState) -> {t(), HostState}.
-execute(GS, HostState) ->
-    execute(#cs.plan, fun real_world/2, undefined, fun result_handler/4, GS, HostState).
+execute(CS, HostState) ->
+    execute(#cs.plan, fun real_world/2, undefined, fun result_handler/4, CS, HostState).
 
 -spec execute(
     integer(), effect_handler(EffHandlerState), EffHandlerState, result_handler(), t(), HostState
 ) -> {EffHandlerState, t(), HostState}.
-execute(Field, EffectHandler, EffHandlerState0, ResultHandler, GS0, Acc0) ->
-    case element(Field, GS0) of
+execute(Field, EffectHandler, EffHandlerState0, ResultHandler, CS0, HS0) ->
+    ?tp_ignore_side_effects_in_prod(emqx_ds_client_exec_loop, #{field => Field}),
+    case element(Field, CS0) of
         [] ->
             %% No planned effects:
-            {EffHandlerState0, GS0, Acc0};
+            ?tp_ignore_side_effects_in_prod(emqx_ds_client_exec_done, #{
+                cs => inspect(CS0), hs => HS0
+            }),
+            {EffHandlerState0, CS0, HS0};
         Effects ->
             %% Clear effects in the state:
-            GS1 = erlang:setelement(Field, GS0, []),
-            {EffHandlerState, GS, Acc} = do_execute(
-                EffectHandler, EffHandlerState0, ResultHandler, lists:reverse(Effects), GS1, Acc0
+            CS1 = erlang:setelement(Field, CS0, []),
+            {EffHandlerState, CS, HS} = do_execute(
+                EffectHandler, EffHandlerState0, ResultHandler, lists:reverse(Effects), CS1, HS0
             ),
-            execute(Field, EffectHandler, EffHandlerState, ResultHandler, GS, Acc)
+            %% Note: from this point on we always continue on the
+            %% `#cs.plan', even if the original `Field' was
+            %% `#cs.retry'. Effects can fail again, we should retry
+            %% them later:
+            execute(#cs.plan, EffectHandler, EffHandlerState, ResultHandler, CS, HS)
     end.
 
 -spec do_execute(
     effect_handler(EffHandlerState), EffHandlerState, result_handler(), [effect()], t(), HostState
 ) -> {EffHandlerState, t(), HostState}.
-do_execute(_, EffHandlerState, _, [], GS, Acc) ->
-    {EffHandlerState, GS, Acc};
-do_execute(EffectHandler, EffHandlerState0, ResultHandler, [Effect | Effects], GS0, Acc0) ->
+do_execute(_, EffHandlerState, _, [], CS, Acc) ->
+    {EffHandlerState, CS, Acc};
+do_execute(EffectHandler, EffHandlerState0, ResultHandler, [Effect | Effects], CS0, Acc0) ->
     {Result, EffHandlerState} = EffectHandler(Effect, EffHandlerState0),
-    %% io:format(user, "Exec ~p -> ~p~n", [Effect, Result]),
-    {GS, Acc} = ResultHandler(Effect, GS0, Acc0, Result),
-    do_execute(EffectHandler, EffHandlerState, ResultHandler, Effects, GS, Acc).
+    ?tp_ignore_side_effects_in_prod(emqx_ds_client_exec, #{eff => Effect, res => Result}),
+    {CS, Acc} = ResultHandler(Effect, CS0, Acc0, Result),
+    do_execute(EffectHandler, EffHandlerState, ResultHandler, Effects, CS, Acc).
 
 %%------------------------------------------------------------------------------
 %% Callback module wrappers:
@@ -900,11 +916,6 @@ get_current_generation(CBM, SubId, Shard, HostState) ->
 get_iterator(CBM, SubId, Slab, Stream, HostState) ->
     CBM:get_iterator(SubId, Slab, Stream, HostState).
 
--spec on_advance_generation(module(), sub_id(), emqx_ds:shard(), emqx_ds:generation(), HostState) ->
-    HostState.
-on_advance_generation(CBM, SubId, Shard, NewCurrentGeneration, HostState) ->
-    CBM:on_advance_generation(SubId, Shard, NewCurrentGeneration, HostState).
-
 -spec on_new_iterator(
     module(), sub_id(), emqx_ds:slab(), emqx_ds:stream(), emqx_ds:iterator(), HostState
 ) ->
@@ -918,3 +929,115 @@ on_new_iterator(CBM, SubId, Slab, Stream, Iterator, HostState) ->
     HostState.
 on_make_iterator_fail(CBM, SubId, Slab, Stream, Error, HostState) ->
     CBM:on_make_iterator_fail(SubId, Slab, Stream, Error, HostState).
+
+-spec on_advance_generation(module(), sub_id(), emqx_ds:shard(), emqx_ds:generation(), HostState) ->
+    HostState.
+on_advance_generation(CBM, SubId, Shard, NewCurrentGeneration, HostState) ->
+    CBM:on_advance_generation(SubId, Shard, NewCurrentGeneration, HostState).
+
+%%------------------------------------------------------------------------------
+%% Misc.
+%%------------------------------------------------------------------------------
+
+-doc "Destroy all streams that belong to `SubId`.".
+-spec streams_destroy_(t(), sub_id()) -> t().
+streams_destroy_(CS0 = #cs{streams = Streams}, SubId) ->
+    maps:fold(
+        fun
+            ({SId, Shard}, _, Acc) when SId =:= SubId ->
+                stream_cache_destroy_(Acc, SubId, Shard);
+            (_, _, Acc) ->
+                Acc
+        end,
+        CS0,
+        Streams
+    ).
+
+-doc "Remove stream cache from the state and schedule clean up of all active subscriptions.".
+-spec stream_cache_destroy_(t(), sub_id(), emqx_ds:shard()) -> t().
+stream_cache_destroy_(CS0 = #cs{streams = Streams0}, SubId, Shard) ->
+    {#stream_cache{active = Active}, Streams} = maps:take({SubId, Shard}, Streams0),
+    CS = CS0#cs{streams = Streams},
+    maps:fold(
+        fun
+            (_Stream, {_Iterator, undefined}, Acc) ->
+                Acc;
+            (_Stream, {_Iterator, SRef}, Acc) ->
+                ds_unsub_(Acc, SRef)
+        end,
+        CS,
+        Active
+    ).
+
+-doc "Schedule DS unsubscribe event and remove DS subscription from the state.".
+-spec ds_unsub_(t(), emqx_ds:sub_ref()) -> t().
+ds_unsub_(CS0 = #cs{ds_subs = DSSubs0}, SRef) ->
+    {#ds_sub{handle = Handle, db = DB}, DSSubs} = maps:take(SRef, DSSubs0),
+    CS = CS0#cs{ds_subs = DSSubs},
+    plan(#eff_ds_unsub{ref = SRef, db = DB, handle = Handle}, CS).
+
+-doc "Plan subscription to the stream events followed by stream renewal.".
+-spec watch_streams_(t(), sub_id(), sub(), _HostState) -> t().
+watch_streams_(CS0, SubId, Sub = #sub{db = DB, topic = Topic}, HostState) ->
+    CS1 = plan(#eff_watch_streams{sub_id = SubId, db = DB, topic = Topic}, CS0),
+    renew_streams_(CS1, SubId, Sub, HostState).
+
+-doc "Schedule unwatch effect and remove watch from the state.".
+-spec unwatch_streams_(t(), sub_id(), sub()) -> t().
+unwatch_streams_(CS0 = #cs{new_streams_watches = Watches0}, SubId, #sub{db = DB}) ->
+    case emqx_utils_maps:find_key(SubId, Watches0) of
+        {ok, Watch} ->
+            CS1 = CS0#cs{new_streams_watches = maps:remove(Watch, Watches0)},
+            plan(#eff_unwatch_streams{db = DB, watch = Watch}, CS1);
+        undefined ->
+            CS0
+    end.
+
+-doc """
+Run a function in the context of stream cache belonging to one shard of a subscription.
+Insert the updated stream cache record into the #cs record.
+
+- This function allows mutation of the host state.
+- If stream cache doesn't exist, it will create a fresh record and initialize it
+  with the host's current generation.
+""".
+-spec with_stream_cache(sub_id(), emqx_ds:shard(), t(), HostState, fun(
+    (stream_cache()) -> {stream_cache(), t(), HostState}
+)) ->
+    {t(), HostState}.
+with_stream_cache(SubId, Shard, CS0 = #cs{cbm = CBM, streams = Streams}, HostState0, Fun) ->
+    Key = {SubId, Shard},
+    %% Get the existing cache or create new empty one:
+    case Streams of
+        #{Key := Cache0} ->
+            ok;
+        #{} ->
+            Cache0 = #stream_cache{
+                current_gen = get_current_generation(CBM, SubId, Shard, HostState0)
+            }
+    end,
+    {Cache, CS1, HostState} = Fun(Cache0),
+    CS = CS1#cs{streams = Streams#{Key => Cache}},
+    {CS, HostState}.
+
+-doc """
+Run a function in the context of stream cache belonging to one shard of a subscription.
+Insert the updated stream cache record into the #cs record.
+
+This function does not allow mutation of the host state.
+""".
+-spec with_stream_cache(sub_id(), emqx_ds:shard(), t(), fun(
+    (stream_cache() | undefined) -> {stream_cache(), t()} | stream_cache() | undefined
+)) ->
+    t().
+with_stream_cache(SubId, Shard, CS0 = #cs{streams = Streams}, Fun) ->
+    Key = {SubId, Shard},
+    Cache0 = maps:get(Key, Streams, undefined),
+    case Fun(Cache0) of
+        #stream_cache{} = Cache ->
+            CS0#cs{streams = Streams#{Key => Cache}};
+        {Cache = #stream_cache{}, CS = #cs{}} ->
+            CS#cs{streams = Streams#{Key => Cache}};
+        undefined ->
+            CS0
+    end.

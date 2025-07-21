@@ -28,12 +28,6 @@
 
 -define(fake_shards, [<<"0">>, <<"12">>]).
 
--define(record_to_map(RECORD), fun(Val) ->
-    Fields = record_info(fields, RECORD),
-    [_Tag | Values] = tuple_to_list(Val),
-    maps:from_list(lists:zip(Fields, Values))
-end).
-
 %%================================================================================
 %% Basic tests
 %%================================================================================
@@ -164,13 +158,27 @@ filter_effects_test() ->
 get_current_generation(SubId, Shard, #test_host_state{generations = Gens}) ->
     maps:get({SubId, Shard}, Gens, 0).
 
-on_advance_generation(SubId, Shard, NextGen, HS = #test_host_state{generations = Gens0}) ->
-    io:format("Host advances generation ~p ~p -> ~p~n", [SubId, Shard, NextGen]),
+on_advance_generation(
+    SubId, Shard, NextGen, HS = #test_host_state{generations = Gens0}
+) ->
+    OldCurrent = get_current_generation(SubId, Shard, HS),
+    ?tp(test_host_advance_generation, #{
+        subid => SubId, shard => Shard, old => OldCurrent, new => NextGen
+    }),
+    ?assert(
+        NextGen > OldCurrent,
+        {"New generation should be greater than the old one", NextGen, '>', OldCurrent}
+    ),
     Gens = Gens0#{{SubId, Shard} => NextGen},
-    HS#test_host_state{generations = Gens}.
+    HS#test_host_state{
+        generations = Gens
+    }.
 
-on_new_iterator(SubId, _Slab, Stream, It, HS0 = #test_host_state{iterators = Its}) ->
+on_new_iterator(
+    SubId, _Slab, Stream, It, HS0 = #test_host_state{iterators = Its}
+) ->
     Key = {SubId, Stream},
+    ?tp(test_host_new_iterator, #{subid => SubId, stream => Stream, it => It}),
     ?assertNot(maps:is_key(Key, Its), "Client should not re-create iterators"),
     HS = HS0#test_host_state{
         iterators = Its#{Key => It}
@@ -180,7 +188,7 @@ on_new_iterator(SubId, _Slab, Stream, It, HS0 = #test_host_state{iterators = Its
 get_iterator(SubId, _Slab, Stream, #test_host_state{iterators = Its}) ->
     case Its of
         #{{SubId, Stream} := It} ->
-            {ok, It};
+            {subscribe, It};
         #{} ->
             undefined
     end.
@@ -190,10 +198,13 @@ get_iterator(SubId, _Slab, Stream, #test_host_state{iterators = Its}) ->
 %%================================================================================
 
 -define(test_sub_ids, [id1, id2]).
+%-define(test_sub_ids, [id1]).
 
--define(err_get_streams, 2#1).
--define(err_make_iterator, 2#10).
--define(err_subscribe, 2#100).
+-define(err_get_streams, err_get_streams).
+-define(err_make_iterator, err_make_iterator).
+-define(err_subscribe, err_subscribe).
+
+-type error_type() :: ?err_get_streams | ?err_make_iterator | ?err_subscribe.
 
 %% "All the world's a stage", Shakespeare.
 %%
@@ -215,7 +226,7 @@ get_iterator(SubId, _Slab, Stream, #test_host_state{iterators = Its}) ->
     current_generation = #{} :: #{emqx_ds:shard() => emqx_ds:generation()},
     streams = [] :: [{{emqx_ds:slab()}, _Stream}],
     %% Mask of injected recoverable errors for the shards:
-    err_rec = #{} :: #{emqx_ds:shard() => byte()},
+    err_rec = #{} :: #{{emqx_ds:shard(), error_type()} => true},
     subs = #{} :: #{emqx_ds_client:sub_id() => {_DB, _Topic, _Opts}},
     exists = false :: boolean(),
     runtime = {#world_stage{}, undefined, #test_host_state{}}
@@ -228,11 +239,13 @@ current_gen(Shard, #model_state{current_generation = CG}) ->
 %% Proper generators
 %%------------------------------------------------------------------------------
 
+-define(call_wrapper(MS, FUN, ARGS), {call, ?MODULE, wrapper, [MS, FUN, ARGS]}).
+
 gen_add_generation(MS) ->
     ?LET(
         {Shard, Delta},
         {oneof(?fake_shards), range(1, 4)},
-        {call, ?MODULE, add_generation, [Shard, current_gen(Shard, MS) + Delta, MS]}
+        ?call_wrapper(MS, add_generation, [Shard, current_gen(Shard, MS) + Delta])
     ).
 
 gen_add_stream(MS = #model_state{counter = Ctr}) ->
@@ -241,32 +254,53 @@ gen_add_stream(MS = #model_state{counter = Ctr}) ->
         oneof(?fake_shards),
         begin
             Stream = #fake_stream{shard = Shard, gen = current_gen(Shard, MS), id = Ctr},
-            {call, ?MODULE, add_stream, [Stream, MS]}
+            ?call_wrapper(MS, add_stream, [Stream])
         end
     ).
 
 gen_new(MS) ->
-    exactly({call, ?MODULE, fake_new, [MS]}).
+    exactly(?call_wrapper(MS, fake_new, [])).
 
 gen_destroy(MS = #model_state{}) ->
-    exactly({call, ?MODULE, fake_destroy, [MS]}).
+    exactly(?call_wrapper(MS, fake_destroy, [])).
 
 gen_subscribe(MS) ->
     ?LET(
         Id,
         oneof(?test_sub_ids),
-        {call, ?MODULE, fake_subscribe, [Id, test_db, [<<"test_topic">>], MS]}
+        ?call_wrapper(MS, fake_subscribe, [Id, test_db, [<<"test_topic">>]])
     ).
 
 gen_unsubscribe(MS) ->
     ?LET(
         Id,
         oneof(?test_sub_ids),
-        {call, ?MODULE, fake_unsubscribe, [Id, MS]}
+        ?call_wrapper(MS, fake_unsubscribe, [Id])
     ).
 
-gen_fix_all_errors() ->
-    exactly({call, ?MODULE, fix_all_errors, []}).
+gen_error_type() ->
+    oneof([
+        ?err_get_streams,
+        ?err_make_iterator,
+        ?err_subscribe
+    ]).
+
+gen_inject_error(MS) ->
+    ?LET(
+        {Shard, Mask},
+        {oneof(?fake_shards), gen_error_type()},
+        ?call_wrapper(MS, inject_error, [Shard, Mask])
+    ).
+
+gen_fix_error(MS) ->
+    ?LET(
+        {Shard, Mask},
+        oneof(maps:keys(MS#model_state.err_rec)),
+        ?call_wrapper(MS, fix_error, [Shard, Mask])
+    ).
+
+gen_fix_all_errors(MS) ->
+    exactly(?call_wrapper(MS, fix_all_errors, [])).
 
 %%------------------------------------------------------------------------------
 %% Proper statem callbacks
@@ -279,8 +313,10 @@ command(MS = #model_state{exists = false}) ->
     gen_new(MS);
 command(MS = #model_state{err_rec = Errors}) ->
     frequency(
-        [{3, gen_fix_all_errors()} || maps:size(Errors) > 0] ++
+        [{3, gen_fix_all_errors(MS)} || maps:size(Errors) > 0] ++
+            [{3, gen_fix_error(MS)} || maps:size(Errors) > 0] ++
             [
+                {3, gen_inject_error(MS)},
                 {1, gen_destroy(MS)},
                 {3, gen_subscribe(MS)},
                 {2, gen_unsubscribe(MS)},
@@ -289,66 +325,52 @@ command(MS = #model_state{err_rec = Errors}) ->
             ]
     ).
 
-next_state(ModelState, RuntimeState, {call, ?MODULE, fake_new, _}) ->
+next_state(MS0, RuntimeState, ?call_wrapper(_, Fun, Args)) ->
+    MS = next_state_(MS0, Fun, Args),
+    MS#model_state{runtime = RuntimeState}.
+
+next_state_(ModelState, fake_new, _) ->
     ModelState#model_state{
-        exists = true,
-        runtime = RuntimeState
+        exists = true
     };
-next_state(ModelState, RuntimeState, {call, ?MODULE, fake_destroy, _}) ->
+next_state_(ModelState, fake_destroy, _) ->
     ModelState#model_state{
         exists = false,
-        runtime = RuntimeState,
         subs = #{}
     };
-next_state(
-    MS = #model_state{subs = Subs},
-    RuntimeState,
-    {call, ?MODULE, fake_subscribe, [SubId, DB, Topic, _]}
-) ->
+next_state_(MS = #model_state{subs = Subs}, fake_subscribe, [SubId, DB, Topic]) ->
     MS#model_state{
-        subs = Subs#{SubId => {DB, Topic}},
-        runtime = RuntimeState
+        subs = Subs#{SubId => {DB, Topic}}
     };
-next_state(
-    MS = #model_state{subs = Subs},
-    RuntimeState,
-    {call, ?MODULE, fake_unsubscribe, [SubId, _]}
-) ->
+next_state_(MS = #model_state{subs = Subs}, fake_unsubscribe, [SubId]) ->
     MS#model_state{
-        subs = maps:remove(SubId, Subs),
-        runtime = RuntimeState
+        subs = maps:remove(SubId, Subs)
     };
-next_state(
-    MS = #model_state{current_generation = CG},
-    RuntimeState,
-    {call, ?MODULE, add_generation, [Shard, Generation, _]}
-) ->
+next_state_(MS = #model_state{current_generation = CG}, add_generation, [Shard, Generation]) ->
     MS#model_state{
-        current_generation = CG#{Shard => Generation},
-        runtime = RuntimeState
+        current_generation = CG#{Shard => Generation}
     };
-next_state(
-    MS = #model_state{streams = Streams, counter = Ctr},
-    RuntimeState,
-    {call, ?MODULE, add_stream, [Stream, _]}
-) ->
+next_state_(MS = #model_state{streams = Streams, counter = Ctr}, add_stream, [Stream]) ->
     MS#model_state{
         counter = Ctr + 1,
-        runtime = RuntimeState,
         streams = [Stream | Streams]
     };
-next_state(
-    MS = #model_state{},
-    _,
-    {call, ?MODULE, fix_all_errors, []}
-) ->
+next_state_(MS = #model_state{err_rec = Errors}, inject_error, [Shard, ErrorType]) ->
+    MS#model_state{
+        err_rec = Errors#{{Shard, ErrorType} => true}
+    };
+next_state_(MS = #model_state{err_rec = Errors}, fix_error, [Shard, ErrorType]) ->
+    MS#model_state{
+        err_rec = maps:remove({Shard, ErrorType}, Errors)
+    };
+next_state_(MS = #model_state{}, fix_all_errors, _) ->
     MS#model_state{
         err_rec = #{}
     }.
 
-precondition(#model_state{subs = Subs}, {call, ?MODULE, fake_subscribe, [SubId | _]}) ->
+precondition(#model_state{subs = Subs}, ?call_wrapper(_, fake_subscribe, [SubId | _])) ->
     not maps:is_key(SubId, Subs);
-precondition(#model_state{subs = Subs}, {call, ?MODULE, fake_unsubscribe, [SubId | _]}) ->
+precondition(#model_state{subs = Subs}, ?call_wrapper(_, fake_unsubscribe, [SubId | _])) ->
     maps:is_key(SubId, Subs);
 precondition(_, _) ->
     true.
@@ -356,6 +378,8 @@ precondition(_, _) ->
 postcondition(PrevState, Call, Result) ->
     CurrentState = next_state(PrevState, Result, Call),
     prop_ownership(CurrentState),
+    prop_active_subscriptions(CurrentState),
+    prop_no_pending_when_healthy(CurrentState),
     prop_host_seen_all_streams(CurrentState).
 
 %%------------------------------------------------------------------------------
@@ -377,26 +401,31 @@ proper_test_() ->
 
 run_proper() ->
     ProperOpts = [
-        {numtests, 100},
-        {max_size, 300},
+        {numtests, 200},
+        {max_size, 100},
         {on_output, fun(Fmt, Args) -> io:format(user, Fmt, Args) end}
     ],
     ?assert(
         proper:quickcheck(
-            ?FORALL(
+            ?forall_trace(
                 Cmds,
-                proper_statem:commands(?MODULE),
+                proper_statem:more_commands(
+                    2,
+                    proper_statem:commands(?MODULE)
+                ),
                 begin
-                    {_History, State, Result} = proper_statem:run_commands(?MODULE, Cmds),
-                    ?WHENFAIL(
-                        io:format(
-                            user,
-                            "Commands:~n~s~nState: ~p\nResult: ~p~n",
-                            [format_cmds(Cmds), pprint_state(State), Result]
-                        ),
-                        aggregate(command_names(Cmds), Result =:= ok)
-                    )
-                end
+                    {_History, _State, Result} = proper_statem:run_commands(?MODULE, Cmds),
+                    ?assertMatch(ok, Result)
+                    %% ?WHENFAIL(
+                    %%     io:format(
+                    %%         user,
+                    %%         "Commands:~n~s~nState: ~p\nResult: ~p~n",
+                    %%         [format_cmds(Cmds), pprint_mstate(State), Result]
+                    %%     ),
+                    %%     aggregate(command_names(Cmds), Result =:= ok)
+                    %% )
+                end,
+                []
             ),
             ProperOpts
         )
@@ -404,22 +433,20 @@ run_proper() ->
 
 format_cmds(Cmds) ->
     lists:map(
-        fun({set, _, {call, Mod, Fun, Args0}}) ->
-            Args = [I || I <- Args0, not is_record(I, model_state)],
-            io_lib:format("   ~p:~p  ~p~n", [Mod, Fun, Args])
+        fun({set, _, ?call_wrapper(_, Fun, Args)}) ->
+            io_lib:format("   ~p ~p~n", [Fun, Args])
         end,
         Cmds
     ).
 
-pprint_state(ModelState0 = #model_state{runtime = {WS, CS, HS}}) ->
-    ModelState = ModelState0#model_state{
+pprint_mstate(MS = #model_state{runtime = {WS, CS, HS}}) ->
+    ?record_to_map(model_state, MS#model_state{
         runtime = #{
-            world => (?record_to_map(world_stage))(WS),
-            client => (?record_to_map(cs))(CS),
-            host => (?record_to_map(test_host_state))(HS)
+            world => ?record_to_map(world_stage, WS),
+            client => emqx_ds_client:pprint_cs(CS),
+            host => ?record_to_map(test_host_state, HS)
         }
-    },
-    (?record_to_map(model_state))(ModelState).
+    }).
 
 subscribe__test() ->
     try
@@ -605,9 +632,9 @@ prop_host_seen_all_streams(#model_state{
                                         }
                                     );
                                 Current when Gen < Current ->
-                                    %% FIXME: should be end_of_stream
+                                    %% Note: test host doesn't clean up replayed streams.
                                     ?assertMatch(
-                                        #{{SubId, Stream} := #fake_iter{}},
+                                        #{{SubId, Stream} := end_of_stream},
                                         HostIters,
                                         #{
                                             msg =>
@@ -630,9 +657,110 @@ prop_host_seen_all_streams(#model_state{
             true
     end.
 
+%% When the system is healthy, all streams for the current generation
+%% should be either fully replayed or active.
+prop_no_pending_when_healthy(#model_state{err_rec = Errors, runtime = {_WS, CS, _}}) ->
+    Healthy = maps:size(Errors) =:= 0,
+    case CS of
+        #cs{} when Healthy ->
+            %% Client exists and the system is healthy:
+            maps:foreach(
+                fun({SubId, Shard}, #stream_cache{pending_iterator = Pending}) ->
+                    ?assertMatch(
+                        [],
+                        Pending,
+                        #{
+                            msg => "All iterators should be present when the system is healthy",
+                            subid => SubId,
+                            shard => Shard
+                        }
+                    )
+                end,
+                CS#cs.streams
+            );
+        _ ->
+            ok
+    end.
+
+%% There is 1:1 correspondence between active streams and DS subscriptions:
+prop_active_subscriptions(#model_state{runtime = {_WS, undefined, _HS}}) ->
+    ok;
+prop_active_subscriptions(#model_state{runtime = {_WS, CS, _HS}}) ->
+    #cs{ds_subs = DSSubs, streams = Streams} = CS,
+    %% Collect all active streams with subscriptions:
+    ActiveStreams = maps:fold(
+        fun(_, #stream_cache{active = Active}, Acc) ->
+            maps:fold(
+                fun
+                    (_, {_It, undefined}, Acc1) ->
+                        Acc1;
+                    (_, {_It, SubRef}, Acc1) ->
+                        [SubRef | Acc1]
+                end,
+                Acc,
+                Active
+            )
+        end,
+        [],
+        Streams
+    ),
+    %% Compare the result with the DS subs:
+    snabbkaffe_diff:assert_lists_eq(
+        lists:sort(ActiveStreams),
+        lists:sort(maps:keys(DSSubs)),
+        #{comment => emqx_ds_client:inspect(CS)}
+    ).
+
 %%------------------------------------------------------------------------------
 %% Fake versions of commands
 %%------------------------------------------------------------------------------
+
+fake_new(#model_state{runtime = {WS, _, HS}}) ->
+    GS = emqx_ds_client:new(?MODULE, #{retry_interval => 10000000}),
+    {WS, GS, HS}.
+
+fake_destroy(MS = #model_state{runtime = {WS, GS0, HS}}) ->
+    GS = emqx_ds_client:destroy_(GS0),
+    setelement(
+        2,
+        execute(MS#model_state{runtime = {WS, GS, HS}}),
+        undefined
+    ).
+
+fake_subscribe(MS = #model_state{runtime = {WS, GS0, HS}}, SubId, DB, Topic) ->
+    {ok, GS} = emqx_ds_client:subscribe_(
+        GS0,
+        #{id => SubId, db => DB, topic => Topic},
+        HS
+    ),
+    execute(MS#model_state{runtime = {WS, GS, HS}}).
+
+fake_unsubscribe(MS = #model_state{runtime = {WS, GS0, HS0}}, SubId) ->
+    {ok, GS, HS} = emqx_ds_client:unsubscribe_(GS0, SubId, HS0),
+    execute(MS#model_state{runtime = {WS, GS, HS}}).
+
+add_generation(#model_state{runtime = RS}, _Shard, _Generation) ->
+    RS.
+
+add_stream(MS = #model_state{runtime = RS = {WS, _CS, _HS}}, _Stream) ->
+    #world_stage{watches = Watches} = WS,
+    Events = [#new_stream_event{subref = W} || W <- Watches],
+    EffHandler = fake_world(MS),
+    lists:foldl(
+        fun(Msg, RSAcc) ->
+            fake_dispatch(EffHandler, Msg, RSAcc)
+        end,
+        RS,
+        Events
+    ).
+
+fix_all_errors(#model_state{runtime = RS}) ->
+    RS.
+
+inject_error(#model_state{runtime = RS}, _Shard, _Mask) ->
+    RS.
+fix_error(#model_state{runtime = RS}, _Shard, _Mask) ->
+    RS.
 
 %% Execute plan with the fake effect handler:
 execute(
@@ -646,75 +774,6 @@ execute(
         GS0,
         HostState0
     ).
-
-fake_new(MS = #model_state{runtime = {WS, _, HS}}) ->
-    wrap_cmd(
-        MS,
-        begin
-            GS = emqx_ds_client:new(?MODULE, #{retry_interval => 10000000}),
-            {WS, GS, HS}
-        end
-    ).
-
-fake_destroy(MS = #model_state{runtime = {WS, GS0, HS}}) ->
-    wrap_cmd(
-        MS,
-        begin
-            GS = emqx_ds_client:destroy_(GS0),
-            setelement(
-                2,
-                execute(MS#model_state{runtime = {WS, GS, HS}}),
-                undefined
-            )
-        end
-    ).
-
-fake_subscribe(SubId, DB, Topic, MS = #model_state{runtime = {WS, GS0, HS}}) ->
-    wrap_cmd(
-        MS,
-        begin
-            {ok, GS} = emqx_ds_client:subscribe_(
-                GS0,
-                #{id => SubId, db => DB, topic => Topic},
-                HS
-            ),
-            execute(MS#model_state{runtime = {WS, GS, HS}})
-        end
-    ).
-
-fake_unsubscribe(SubId, MS = #model_state{runtime = {WS, GS0, HS0}}) ->
-    wrap_cmd(
-        MS,
-        begin
-            {ok, GS, HS} = emqx_ds_client:unsubscribe_(GS0, SubId, HS0),
-            execute(MS#model_state{runtime = {WS, GS, HS}})
-        end
-    ).
-
-add_generation(_Shard, _Generation, MS = #model_state{runtime = RS}) ->
-    wrap_cmd(MS, RS).
-
-add_stream(Stream, MS0 = #model_state{runtime = RS = {WS, _CS, _HS}, streams = ModelStreams}) ->
-    %% Note: proper runs commands on the _previous_ state. We should account for that.
-    MS = MS0#model_state{streams = [Stream | ModelStreams]},
-    wrap_cmd(
-        MS,
-        begin
-            #world_stage{watches = Watches} = WS,
-            Events = [#new_stream_event{subref = W} || W <- Watches],
-            EffHandler = fake_world(MS),
-            lists:foldl(
-                fun(Msg, RSAcc) ->
-                    fake_dispatch(EffHandler, Msg, RSAcc)
-                end,
-                RS,
-                Events
-            )
-        end
-    ).
-
-fix_all_errors() ->
-    ok.
 
 %%------------------------------------------------------------------------------
 %% Helper functions
@@ -737,7 +796,20 @@ fake_dispatch(EffHandler, Message, {WS, CS, HS}) ->
             Result
     end.
 
-wrap_cmd(MS, RS = {#world_stage{}, CS, #test_host_state{}}) ->
+wrapper(MS0, Fun, Args) ->
+    %% Due to PropEr design, here MS0 is the model state _before_
+    %% applying the effect. This is fairly inconvenient. Advance the
+    %% model state accoding to the symbolic execution rules without
+    %% changing the runtime state:
+    MS = next_state_(MS0, Fun, Args),
+    ?tp("test_" ++ atom_to_list(Fun), #{args => Args}),
+    %% Apply the function to the state and also verify the return
+    %% value of the operation, it should be a valid runtime state
+    %% triple:
+    RS =
+        {#world_stage{}, CS, #test_host_state{}} =
+        apply(?MODULE, Fun, [MS | Args]),
+    %% Emulate firing of the retry timer if the client exists:
     case CS of
         undefined ->
             RS;
@@ -760,8 +832,8 @@ fake_world(#model_state{
     streams = Streams,
     err_rec = Errors
 }) ->
-    Err = fun(Shard, Mask) ->
-        (maps:get(Shard, Errors, 0) band Mask) =:= 0
+    Err = fun(Shard, ErrorType) ->
+        not maps:is_key({Shard, ErrorType}, Errors)
     end,
     fun
         (#eff_watch_streams{sub_id = SubId}, Stage) ->
