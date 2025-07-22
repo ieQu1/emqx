@@ -14,6 +14,7 @@
 -record(ds_sub, {
     id :: emqx_ds_client:sub_id(),
     handle :: emqx_ds:subscription_handle(),
+    slab :: emqx_ds:slab(),
     stream :: emqx_ds:stream(),
     db :: emqx_ds:db()
 }).

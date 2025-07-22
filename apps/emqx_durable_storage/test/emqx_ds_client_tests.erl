@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
 %% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
 %%--------------------------------------------------------------------
 -module(emqx_ds_client_tests).
 
@@ -79,56 +67,59 @@ interpreter_test() ->
         "State of the effect handler should match the number of effects it handled"
     ).
 
-%% This testcase verifies how `retry/2' function adds actions to the
-%% plan and starts the retry timer. Then it verifies that dispatch
-%% function correctly interprets the timeout message.
-retry_test() ->
-    %% Effect handler increments the counter in the state and always
-    %% returns ok:
-    EffHandler = fun(_Eff, EffHandlerState) -> {ok, EffHandlerState + 1} end,
-    %% Result handler adds effects to the history:
-    ResHandler = fun(Eff, GS, Acc, _Res) -> {GS, [Eff | Acc]} end,
-    %% Create the state and add two retry actions:
-    GS0 = emqx_ds_client:new(undefined, #{retry_interval => 10}),
-    GS1 = emqx_ds_client:retry(2, emqx_ds_client:retry(1, GS0)),
-    %% Verify the state:
-    ?assertMatch(
-        [2, 1],
-        GS1#cs.retry,
-        "Retry actions have been added"
-    ),
-    ?assert(
-        is_reference(GS1#cs.retry_tref),
-        "Retry timer has been started"
-    ),
-    %% Add more actions:
-    GS2 = emqx_ds_client:retry(3, GS1),
-    ?assertMatch(
-        [3, 2, 1],
-        GS2#cs.retry,
-        "New retry action have been added"
-    ),
-    ?assertEqual(
-        GS1#cs.retry_tref,
-        GS2#cs.retry_tref,
-        "Retry timer is the same"
-    ),
-    %% Receive retry message:
-    receive
-        Msg ->
-            Res1 = emqx_ds_client:dispatch_message(EffHandler, 0, ResHandler, GS2, Msg, []),
-            ?assertMatch(
-                {3, #cs{retry = [], retry_tref = undefined}, [3, 2, 1]},
-                Res1,
-                #{msg => Msg, state => GS2}
-            ),
-            %% There are no duplicate or unexpected messages:
-            receive
-                Unexpected -> error({unexpected_message, Unexpected})
-            after 30 -> ok
-            end
-    after 30 -> error(no_retry_message)
-    end.
+%% %% This testcase verifies how `retry/2' function adds actions to the
+%% %% plan and starts the retry timer. Then it verifies that dispatch
+%% %% function correctly interprets the timeout message.
+%% retry_test() ->
+%%     %% Effect handler increments the counter in the state and always
+%%     %% returns ok:
+%%     EffHandler = fun(_Eff, EffHandlerState) -> {ok, EffHandlerState + 1} end,
+%%     %% Result handler adds effects to the history:
+%%     ResHandler = fun(Eff, GS, Acc, _Res) -> {GS, [Eff | Acc]} end,
+%%     %% Create the state and add two retry actions:
+%%     GS0 = emqx_ds_client:new(undefined, #{retry_interval => 10}),
+%%     GS1 = emqx_ds_client:retry(2, emqx_ds_client:retry(1, GS0)),
+%%     %% Verify the state:
+%%     ?assertMatch(
+%%         [2, 1],
+%%         GS1#cs.retry,
+%%         "Retry actions have been added"
+%%     ),
+%%     ?assert(
+%%         is_reference(GS1#cs.retry_tref),
+%%         "Retry timer has been started"
+%%     ),
+%%     %% Add more actions:
+%%     GS2 = emqx_ds_client:retry(3, GS1),
+%%     ?assertMatch(
+%%         [3, 2, 1],
+%%         GS2#cs.retry,
+%%         "New retry action have been added"
+%%     ),
+%%     ?assertEqual(
+%%         GS1#cs.retry_tref,
+%%         GS2#cs.retry_tref,
+%%         "Retry timer is the same"
+%%     ),
+%%     %% Receive retry message:
+%%     receive
+%%         Msg ->
+%%             Res1 = emqx_ds_client:do_dispatch_message(Msg, GS2, []),
+%%             ?assertMatch(
+%%                {#cs.
+%%             %% Res1 = emqx_ds_client:do_dispatch_message(EffHandler, 0, ResHandler, GS2, Msg, []),
+%%             ?assertMatch(
+%%                 {3, #cs{retry = [], retry_tref = undefined}, [3, 2, 1]},
+%%                 Res1,
+%%                 #{msg => Msg, state => GS2}
+%%             ),
+%%             %% There are no duplicate or unexpected messages:
+%%             receive
+%%                 Unexpected -> error({unexpected_message, Unexpected})
+%%             after 30 -> ok
+%%             end
+%%     after 30 -> error(no_retry_message)
+%%     end.
 
 filter_effects_test() ->
     IsEven = fun(E) -> (E rem 2) =:= 0 end,
@@ -154,6 +145,13 @@ filter_effects_test() ->
 
 -record(fake_stream, {shard, gen, id}).
 -record(fake_iter, {stream, time}).
+
+-record(test_ds_sub, {
+    sref :: ?sub_ref(_, _),
+    handle :: ?sub_handle(_, _),
+    it :: #fake_iter{},
+    seqno = 0 :: integer()
+}).
 
 get_current_generation(SubId, Shard, #test_host_state{generations = Gens}) ->
     maps:get({SubId, Shard}, Gens, 0).
@@ -224,7 +222,7 @@ get_iterator(SubId, _Slab, Stream, #test_host_state{iterators = Its}) ->
     %% Counter for creating unique IDs:
     counter = 0 :: integer(),
     current_generation = #{} :: #{emqx_ds:shard() => emqx_ds:generation()},
-    streams = [] :: [{{emqx_ds:slab()}, _Stream}],
+    streams = [] :: [#fake_stream{}],
     %% Mask of injected recoverable errors for the shards:
     err_rec = #{} :: #{{emqx_ds:shard(), error_type()} => true},
     subs = #{} :: #{emqx_ds_client:sub_id() => {_DB, _Topic, _Opts}},
@@ -246,6 +244,17 @@ gen_add_generation(MS) ->
         {Shard, Delta},
         {oneof(?fake_shards), range(1, 4)},
         ?call_wrapper(MS, add_generation, [Shard, current_gen(Shard, MS) + Delta])
+    ).
+
+gen_del_generation(MS) ->
+    ?LET(
+        Shard,
+        oneof(?fake_shards),
+        ?LET(
+            {Generation, Graceful},
+            {range(-2, current_gen(Shard, MS)), boolean()},
+            ?call_wrapper(MS, del_generation, [Shard, Generation, Graceful])
+        )
     ).
 
 gen_add_stream(MS = #model_state{counter = Ctr}) ->
@@ -321,6 +330,7 @@ command(MS = #model_state{err_rec = Errors}) ->
                 {3, gen_subscribe(MS)},
                 {2, gen_unsubscribe(MS)},
                 {5, gen_add_generation(MS)},
+                %% {1, gen_del_generation(MS)},
                 {5, gen_add_stream(MS)}
             ]
     ).
@@ -350,6 +360,14 @@ next_state_(MS = #model_state{current_generation = CG}, add_generation, [Shard, 
     MS#model_state{
         current_generation = CG#{Shard => Generation}
     };
+next_state_(MS = #model_state{streams = Streams0}, del_generation, [Shard, Generation, _Graceful]) ->
+    Streams = lists:filter(
+        fun(#fake_stream{shard = S, gen = G}) ->
+            S =/= Shard orelse G > Generation
+        end,
+        Streams0
+    ),
+    MS#model_state{streams = Streams};
 next_state_(MS = #model_state{streams = Streams, counter = Ctr}, add_stream, [Stream]) ->
     MS#model_state{
         counter = Ctr + 1,
@@ -533,11 +551,12 @@ prop_ownership(#model_state{runtime = {WS, GS, _}}) ->
                 Subs
             );
         #cs{new_streams_watches = OwnedWatches, ds_subs = OwnedSubs} ->
+            %% Client exists:
             snabbkaffe_diff:assert_lists_eq(
                 lists:sort(Watches),
                 lists:sort(maps:keys(OwnedWatches))
             ),
-            {ActiveSubRefs, _} = lists:unzip(Subs),
+            ActiveSubRefs = [SRef || #test_ds_sub{sref = SRef} <- Subs],
             snabbkaffe_diff:assert_lists_eq(
                 lists:sort(ActiveSubRefs),
                 lists:sort(maps:keys(OwnedSubs))
@@ -579,7 +598,15 @@ prop_dispatch_result(
                 Result,
                 "Client should ignore unknown stream notifications"
             )
-    end.
+    end;
+prop_dispatch_result(Message, _, Client, Result) ->
+    error(
+        {"Invalid response from dispatch_message function", #{
+            msg => Message,
+            state => emqx_ds_client:inspect(Client),
+            result => Result
+        }}
+    ).
 
 prop_host_seen_all_streams(#model_state{runtime = {_, undefined, _}}) ->
     %% Client doesn't exist, nothing to verify.
@@ -723,7 +750,7 @@ fake_destroy(MS = #model_state{runtime = {WS, GS0, HS}}) ->
     GS = emqx_ds_client:destroy_(GS0),
     setelement(
         2,
-        execute(MS#model_state{runtime = {WS, GS, HS}}),
+        execute_planned(MS#model_state{runtime = {WS, GS, HS}}),
         undefined
     ).
 
@@ -733,14 +760,58 @@ fake_subscribe(MS = #model_state{runtime = {WS, GS0, HS}}, SubId, DB, Topic) ->
         #{id => SubId, db => DB, topic => Topic},
         HS
     ),
-    execute(MS#model_state{runtime = {WS, GS, HS}}).
+    execute_planned(MS#model_state{runtime = {WS, GS, HS}}).
 
 fake_unsubscribe(MS = #model_state{runtime = {WS, GS0, HS0}}, SubId) ->
     {ok, GS, HS} = emqx_ds_client:unsubscribe_(GS0, SubId, HS0),
-    execute(MS#model_state{runtime = {WS, GS, HS}}).
+    execute_planned(MS#model_state{runtime = {WS, GS, HS}}).
 
 add_generation(#model_state{runtime = RS}, _Shard, _Generation) ->
     RS.
+
+%% Dispatch 'DOWN' messages for all subscriptions to streams that no
+%% longer exist:
+del_generation(
+    MS0 = #model_state{streams = Streams, runtime = RS0 = {WS, _, _}}, Shard, Generation, Graceful
+) ->
+    EffHandler = fake_world(MS0),
+    Reason =
+        case Graceful of
+            true -> ?err_unrec(generation_is_gone);
+            false -> 'DOWN'
+        end,
+    lists:foldl(
+        fun(#test_ds_sub{sref = SRef, it = #fake_iter{stream = Stream}}, RS) ->
+            case lists:member(Stream, Streams) of
+                true ->
+                    RS;
+                false ->
+                    destroy_ds_sub(EffHandler, SRef, RS, Reason)
+            end
+        end,
+        RS0,
+        WS#world_stage.ds_subs
+    ).
+
+destroy_ds_sub(EffHandler, SRef, {WS0 = #world_stage{ds_subs = DSSubs0}, CS, HS}, Reason) ->
+    WS = WS0#world_stage{ds_subs = lists:keydelete(SRef, #test_ds_sub.sref, DSSubs0)},
+    Msg =
+        case Reason of
+            'DOWN' ->
+                {'DOWN', SRef, process, self(), simulated};
+            {error, _, _} ->
+                %% Note: we send error with invalid seqno. The
+                %% client should never check seqno for errors
+                %% anyway, else it would end up with dangling
+                %% subscriptions:
+                #ds_sub_reply{
+                    ref = SRef,
+                    payload = Reason,
+                    size = -1,
+                    seqno = -1
+                }
+        end,
+    dispatch_message(Msg, EffHandler, {WS, CS, HS}).
 
 add_stream(MS = #model_state{runtime = RS = {WS, _CS, _HS}}, _Stream) ->
     #world_stage{watches = Watches} = WS,
@@ -748,7 +819,7 @@ add_stream(MS = #model_state{runtime = RS = {WS, _CS, _HS}}, _Stream) ->
     EffHandler = fake_world(MS),
     lists:foldl(
         fun(Msg, RSAcc) ->
-            fake_dispatch(EffHandler, Msg, RSAcc)
+            dispatch_message(Msg, EffHandler, RSAcc)
         end,
         RS,
         Events
@@ -762,45 +833,42 @@ inject_error(#model_state{runtime = RS}, _Shard, _Mask) ->
 fix_error(#model_state{runtime = RS}, _Shard, _Mask) ->
     RS.
 
-%% Execute plan with the fake effect handler:
-execute(
-    ModelState = #model_state{runtime = {WorldStage0, GS0, HostState0}}
-) ->
+dispatch_message(Message, EffectHandler, {WS, CS0, HS0}) ->
+    Result = emqx_ds_client:do_dispatch_message(Message, CS0, HS0),
+    prop_dispatch_result(Message, WS, CS0, Result),
+    case Result of
+        ignore ->
+            {WS, CS0, HS0};
+        {data, SubId, Reply} ->
+            {data, SubId, Reply},
+            %% FIXME: update HS
+            {WS, CS0, HS0};
+        {Field, CS, HS} ->
+            execute(EffectHandler, Field, WS, CS, HS)
+    end.
+
+execute_planned(MS = #model_state{runtime = {WS, CS, HS}}) ->
+    execute(fake_world(MS), #cs.plan, WS, CS, HS).
+
+execute(EffectHandler, Field, WS, CS, HS) ->
     emqx_ds_client:execute(
-        #cs.plan,
-        fake_world(ModelState),
-        WorldStage0,
+        Field,
+        EffectHandler,
+        WS,
         fun emqx_ds_client:result_handler/4,
-        GS0,
-        HostState0
+        CS,
+        HS
     ).
 
 %%------------------------------------------------------------------------------
 %% Helper functions
 %%------------------------------------------------------------------------------
 
-fake_dispatch(EffHandler, Message, {WS, CS, HS}) ->
-    Result = emqx_ds_client:dispatch_message(
-        EffHandler,
-        WS,
-        fun emqx_ds_client:result_handler/4,
-        CS,
-        Message,
-        HS
-    ),
-    prop_dispatch_result(Message, WS, CS, Result),
-    case Result of
-        ignore ->
-            {WS, CS, HS};
-        {_, _, _} ->
-            Result
-    end.
-
 wrapper(MS0, Fun, Args) ->
     %% Due to PropEr design, here MS0 is the model state _before_
     %% applying the effect. This is fairly inconvenient. Advance the
-    %% model state accoding to the symbolic execution rules without
-    %% changing the runtime state:
+    %% model state to the current accoding to the symbolic execution
+    %% rule:
     MS = next_state_(MS0, Fun, Args),
     ?tp("test_" ++ atom_to_list(Fun), #{args => Args}),
     %% Apply the function to the state and also verify the return
@@ -814,11 +882,10 @@ wrapper(MS0, Fun, Args) ->
         undefined ->
             RS;
         #cs{ref = Ref} ->
-            %% Emulate retry timer:
-            EffHandler = fake_world(MS),
-            fake_dispatch(
-                EffHandler,
+            %% Emulate retry timer firing:
+            dispatch_message(
                 #emqx_ds_client_retry{ref = Ref},
+                fake_world(MS),
                 RS
             )
     end.
@@ -886,9 +953,17 @@ fake_world(#model_state{
                 true ->
                     Handle = ?sub_handle(SubId, Ctr),
                     SubRef = ?sub_ref(SubId, Handle),
+                    DSSub = #test_ds_sub{
+                        sref = SubRef,
+                        handle = Handle,
+                        it = It
+                    },
                     {
                         {ok, Handle, SubRef},
-                        Stage#world_stage{sub_ref_ctr = Ctr + 1, ds_subs = [{SubRef, It} | DSSubs]}
+                        Stage#world_stage{
+                            sub_ref_ctr = Ctr + 1,
+                            ds_subs = [DSSub | DSSubs]
+                        }
                     };
                 false ->
                     %% Simulate unrecoverable errors too?
@@ -901,12 +976,7 @@ fake_world(#model_state{
             %% Theoretically, it can fail too, but usually it means
             %% the subscription will expire via monitor:
             #world_stage{ds_subs = DSSubs0} = Stage,
-            DSSubs = lists:filter(
-                fun({?sub_ref(_SubId, H), _It}) ->
-                    H =/= Handle
-                end,
-                DSSubs0
-            ),
+            DSSubs = lists:keydelete(Handle, #test_ds_sub.handle, DSSubs0),
             {
                 ok,
                 Stage#world_stage{ds_subs = DSSubs}

@@ -10,7 +10,9 @@ It acts as a supervisor for individual DS stream subscriptions.
 
 This module can manage multiple topic subscriptions.
 It doesn't spawn new processes, and is designed to be embedded in
-a host process that handles the business logic.
+a process (host) that handles the business logic.
+
+Host must pass all unknown received messages into `dispatch_message/3` function.
 """.
 
 %% API:
@@ -81,23 +83,50 @@ Global state of the client. It encapsulatees states of all active subscriptions.
 %% Callbacks
 %%================================================================================
 
+-doc """
+Query the host about current generation for the shard.
+Host should return 0 by default.
+""".
 -callback get_current_generation(sub_id(), emqx_ds:shard(), _HostState) -> emqx_ds:generation().
 
+-doc """
+Notify the host that all streams in the current generation have been replayed.
+Client advances to the next generation.
+
+The value of generation passed to this function should be returned by the next `get_current_generation` call.
+""".
 -callback on_advance_generation(sub_id(), emqx_ds:shard(), emqx_ds:generation(), HostState) ->
     HostState.
 
+-doc """
+Query the host about the stream replay position.
+
+## Return values:
+- `undefined`: There is no recorded replay position for the stream.
+  The client should create a new iterator.
+
+- `{subscribe, Iterator}`: Host has record of the previous replay position.
+  The client should create a new subscription with the iterator.
+
+- `{ok, Iterator}`: Iterator exists, but client should not subscribe automatically.
+""".
 -callback get_iterator(sub_id(), emqx_ds:slab(), emqx_ds:stream(), _HostState) ->
     {ok, emqx_ds:iterator() | end_of_stream}
     | {subscribe, emqx_ds:iterator()}
     | undefined.
 
--callback del_iterator(sub_id(), eqmqx_ds:slab(), emqx_ds:stream(), HostState) -> HostState.
-
+-doc """
+Notify the host about creation of a new iterator.
+""".
 -callback on_new_iterator(
     sub_id(), emqx_ds:slab(), emqx_ds:stream(), emqx_ds:iterator(), HostState
 ) ->
     {subscribe | ignore, HostState}.
 
+-doc """
+Notify the host that operation with the stream (creation of iterator or subscription) failed unrecoverably.
+Client will make no further attempts to interact with the stream.
+""".
 -callback on_make_iterator_fail(sub_id(), emqx_ds:slab(), emqx_ds:stream(), _Error, HostState) ->
     HostState.
 
@@ -105,6 +134,9 @@ Global state of the client. It encapsulatees states of all active subscriptions.
 %% API functions
 %%================================================================================
 
+-doc """
+Create the client.
+""".
 -spec new(module(), client_opts()) -> t().
 new(CBM, UserOpts) ->
     Options = maps:merge(
@@ -115,11 +147,29 @@ new(CBM, UserOpts) ->
     ),
     #cs{cbm = CBM, options = Options}.
 
+-doc """
+Destroy the client and all its subscriptions.
+""".
 -spec destroy(t(), HostState) -> HostState.
 destroy(CS, HostState0) ->
     {_, _, HostState} = execute(destroy_(CS), HostState0),
     HostState.
 
+-doc """
+Subscribe to a DS topic.
+
+Mandatory options:
+
+- `db`: DS DB
+- `id`: Unique identifier of the subscription.
+  It can be an arbitrary term, except atom `undefined`.
+  All messages received by the client will be tagged with this ID.
+- `topic`: DS topic.
+
+Optional:
+- `start_time`: Consume messages older than this time.
+- `ds_sub_opts`: Flow control options for the DS subscriptions.
+""".
 -spec subscribe(t(), sub_options(), HostState) ->
     {ok, t(), HostState} | {error, badarg | already_exists}.
 subscribe(CS0, UserOpts = #{id := _, db := _, topic := _}, HostState0) ->
@@ -131,6 +181,9 @@ subscribe(CS0, UserOpts = #{id := _, db := _, topic := _}, HostState0) ->
             Error
     end.
 
+-doc """
+Remove a subscription with the given ID.
+""".
 -spec unsubscribe(t(), sub_id(), HostState) -> {ok, t(), HostState} | {error, not_found}.
 unsubscribe(CS0, SubId, HostState0) ->
     case unsubscribe_(CS0, SubId, HostState0) of
@@ -148,19 +201,19 @@ If atom `ignore` is returned, the message was not addressed to the client and sh
 """.
 -spec dispatch_message(t(), term(), HostState) ->
     ignore | {t(), HostState} | {data, sub_id(), #ds_sub_reply{}}.
-dispatch_message(CS0, Message, HostState0) ->
-    Result = dispatch_message(
-        fun real_world/2, undefined, fun result_handler/4, CS0, Message, HostState0
-    ),
-    case Result of
-        {data, SubId, Data, _EffHandlerState} ->
-            {data, SubId, Data};
-        {_EffHandlerState, CS, HostState} ->
-            {CS, HostState};
+dispatch_message(CS0, Message, HS0) ->
+    case do_dispatch_message(Message, CS0, HS0) of
         ignore ->
-            ignore
+            ignore;
+        {data, SubId, Reply} ->
+            {data, SubId, Reply};
+        {Field, CS, HS} ->
+            execute(Field, CS, HS)
     end.
 
+-doc """
+Pretty-print state of the client.
+""".
 -spec inspect(t()) -> map().
 inspect(CS = #cs{streams = Streams, ds_subs = DSSubs}) ->
     ?record_to_map(cs, CS#cs{
@@ -172,55 +225,90 @@ inspect(CS = #cs{streams = Streams, ds_subs = DSSubs}) ->
 %% Internal functions
 %%================================================================================
 
-%% NOTE: this module is implemented using plan-execute pattern to
-%% simplify error handling and testing
-
--spec dispatch_message(
-    effect_handler(EffectHandlerState),
-    EffectHandlerState,
-    result_handler(),
-    t(),
-    _Message,
-    HostState
-) ->
-    {EffectHandlerState, t(), HostState}
+-spec do_dispatch_message(_Message, t(), HostState) ->
+    {integer(), t(), HostState}
     | ignore
-    | {data, sub_id(), #ds_sub_reply{}, EffectHandlerState}.
-dispatch_message(
-    EffHandler,
-    EffHandlerState,
-    ResultHandler,
-    CS = #cs{ref = Ref, retry_tref = TRef},
+    | {data, sub_id(), #ds_sub_reply{}}.
+do_dispatch_message(
+    {'DOWN', MRef, _, _, _} = Msg,
+    CS0 = #cs{ds_subs = DSSubs},
+    HS
+) ->
+    case DSSubs of
+        #{MRef := DSSub} ->
+            handle_ds_sub_message_(Msg, CS0, MRef, DSSub, HS);
+        #{} ->
+            ignore
+    end;
+do_dispatch_message(#ds_sub_reply{ref = SRef} = Msg, CS0 = #cs{ds_subs = DSSubs}, HS) ->
+    case DSSubs of
+        #{SRef := DSSub} ->
+            handle_ds_sub_message_(Msg, CS0, SRef, DSSub, HS);
+        #{} ->
+            ignore
+    end;
+do_dispatch_message(
     #emqx_ds_client_retry{ref = Ref},
-    HostState
+    CS = #cs{ref = Ref, retry_tref = TRef},
+    HS
 ) when is_reference(TRef) ->
-    %% io:format(user, "Retry ~p~n", [CS#cs.retry]),
-    execute(
-        #cs.retry,
-        EffHandler,
-        EffHandlerState,
-        ResultHandler,
-        CS#cs{retry_tref = undefined},
-        HostState
-    );
-dispatch_message(
-    EffHandler,
-    EffHandlerState,
-    ResHandler,
-    CS0 = #cs{new_streams_watches = Watches, subs = Subs},
-    #new_stream_event{subref = Watch},
-    HostState
+    {#cs.retry, CS, HS};
+do_dispatch_message(
+    #new_stream_event{subref = Watch}, CS0 = #cs{new_streams_watches = Watches, subs = Subs}, HS
 ) ->
     case Watches of
         #{Watch := SubId} ->
             #{SubId := Sub} = Subs,
-            CS = renew_streams_(CS0, SubId, Sub, HostState),
-            execute(#cs.plan, EffHandler, EffHandlerState, ResHandler, CS, HostState);
+            CS = renew_streams_(CS0, SubId, Sub, HS),
+            {#cs.plan, CS, HS};
         #{} ->
             ignore
     end;
-dispatch_message(_, _, _, _, _, _) ->
+do_dispatch_message(_, _, _) ->
     ignore.
+
+handle_ds_sub_message_({'DOWN', _, Type, Pid, Reason}, CS0, SRef, DSSub, HostState) ->
+    #ds_sub{id = SubId, db = DB, handle = Handle, stream = Stream, slab = Slab = {Shard, _Gen}} =
+        DSSub,
+    ?tp(
+        info,
+        emqx_ds_client_subscription_down,
+        #{
+            Type => Pid,
+            reason => Reason,
+            sub_id => SubId,
+            stream => Stream
+        }
+    ),
+    %% This effect will also crean the state:
+    CS1 = plan(#eff_ds_unsub{ref = SRef, db = DB, handle = Handle}, CS0),
+    CS = with_stream_cache(
+        SubId,
+        Shard,
+        CS1,
+        fun(Cache0 = #stream_cache{active = Active}) ->
+            %% Look up sub options:
+            #{SubId := #sub{ds_sub_opts = SubOpts}} = CS0#cs.subs,
+            %% FIXME: ask host instead.
+            #{Stream := {It, _}} = Active,
+            CS2 = plan(
+                #eff_ds_sub{
+                    sub_id = SubId,
+                    db = DB,
+                    slab = Slab,
+                    stream = Stream,
+                    iterator = It,
+                    sub_options = SubOpts
+                },
+                CS1
+            ),
+            Cache = Cache0#stream_cache{
+                active = Active#{Stream => {It, undefined}}
+            },
+            {Cache, CS2}
+        end
+    ),
+    {#cs.plan, CS, HostState}.
 
 -spec destroy_(t()) -> t().
 destroy_(CS0 = #cs{retry_tref = TRef}) ->
@@ -861,10 +949,13 @@ The good news is that the last one is only used for testing.
 `real_world` effect handler ignores its state.
 
 """.
-
 -spec execute(t(), HostState) -> {t(), HostState}.
 execute(CS, HostState) ->
-    execute(#cs.plan, fun real_world/2, undefined, fun result_handler/4, CS, HostState).
+    execute(#cs.plan, CS, HostState).
+
+-spec execute(integer(), t(), HostState) -> {t(), HostState}.
+execute(Field, CS, HostState) ->
+    execute(Field, fun real_world/2, undefined, fun result_handler/4, CS, HostState).
 
 -spec execute(
     integer(), effect_handler(EffHandlerState), EffHandlerState, result_handler(), t(), HostState
