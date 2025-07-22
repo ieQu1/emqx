@@ -283,7 +283,28 @@ handle_ds_sub_message_(Reason = {'DOWN', _, _, _, _}, CS, SRef, DSSub, HS) ->
 handle_ds_sub_message_(#ds_sub_reply{payload = ?err_rec(Reason)}, CS, SRef, DSSub, HS) ->
     handle_ds_sub_recoverable_error_(Reason, CS, SRef, DSSub, HS);
 handle_ds_sub_message_(#ds_sub_reply{payload = ?err_unrec(Reason)}, CS, SRef, DSSub, HS) ->
-    handle_ds_sub_unrecoverable_error_(Reason, CS, SRef, DSSub, HS).
+    handle_ds_sub_unrecoverable_error_(Reason, CS, SRef, DSSub, HS);
+handle_ds_sub_message_(
+    Data = #ds_sub_reply{
+        payload = Payload, seqno = SeqNo, size = Size, stuck = Stuck, lagging = Lagging
+    },
+    CS,
+    SRef,
+    DSSub = #ds_sub{id = SubId, vars = Vars},
+    HS
+) ->
+    case atomics:add_get(Vars, ?ds_sub_a_seqno, Size) of
+        SeqNo ->
+            %% Match:
+            atomics:put(Vars, ?ds_sub_a_stuck, sub_reply_flag_to_int(Stuck)),
+            atomics:put(Vars, ?ds_sub_a_lagging, sub_reply_flag_to_int(Lagging)),
+            {data, SubId, Data};
+        WrongSeqNo ->
+            %% Mismatch:
+            handle_ds_sub_recoverable_error_(
+                {seqno_mismatch, SeqNo, WrongSeqNo}, CS, SRef, DSSub, HS
+            )
+    end.
 
 handle_ds_sub_recoverable_error_(Reason, CS0, SRef, DSSub, HS0) ->
     #cs{cbm = CBM} = CS0,
@@ -790,7 +811,7 @@ add_stream_to_cache(
     end.
 
 maybe_advance_generation(
-    SubId, Shard, Cache0, CS0 = #cs{cbm = CBM, streams = Streams, subs = Subs}, HostState0
+    SubId, Shard, Cache0, CS0 = #cs{cbm = CBM, subs = Subs}, HostState0
 ) ->
     case is_fully_replayed(Cache0) of
         false ->
@@ -1154,3 +1175,6 @@ with_stream_cache(SubId, Shard, CS0 = #cs{streams = Streams}, Fun) ->
         undefined ->
             CS0
     end.
+
+sub_reply_flag_to_int(true) -> 1;
+sub_reply_flag_to_int(_) -> 0.

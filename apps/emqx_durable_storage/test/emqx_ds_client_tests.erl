@@ -325,6 +325,20 @@ gen_ds_sub_recoverable_error(MS) ->
         ?call_wrapper(MS, ds_sub_recoverable_error, [Reason])
     ).
 
+gen_ds_sub_payloads(MS) ->
+    ?LET(
+        {BatchSize, SeqNoError},
+        {
+            range(0, 5),
+            frequency([
+                       {5, 0},
+                       %% FIXME:
+                       {0, range(-3, 3)}
+                      ])
+        },
+        ?call_wrapper(MS, ds_publish_payloads, [BatchSize, SeqNoError])
+    ).
+
 %%------------------------------------------------------------------------------
 %% Proper statem callbacks
 %%------------------------------------------------------------------------------
@@ -339,6 +353,7 @@ command(MS = #model_state{err_rec = Errors, subs = Subs}) ->
         [{3, gen_fix_all_errors(MS)} || maps:size(Errors) > 0] ++
             [{3, gen_fix_error(MS)} || maps:size(Errors) > 0] ++
             [{2, gen_ds_sub_recoverable_error(MS)} || maps:size(Subs) > 0] ++
+            [{2, gen_ds_sub_payloads(MS)} || maps:size(Subs) > 0] ++
             [
                 {3, gen_inject_error(MS)},
                 {1, gen_destroy(MS)},
@@ -393,6 +408,8 @@ next_state_(MS = #model_state{err_rec = Errors}, inject_error, [Shard, ErrorType
         err_rec = Errors#{{Shard, ErrorType} => true}
     };
 next_state_(MS, ds_sub_recoverable_error, _) ->
+    MS;
+next_state_(MS, ds_publish_payloads, _) ->
     MS;
 next_state_(MS = #model_state{err_rec = Errors}, fix_error, [Shard, ErrorType]) ->
     MS#model_state{
@@ -879,6 +896,42 @@ add_stream(MS = #model_state{runtime = RS = {WS, _CS, _HS}}, _Stream) ->
         Events
     ).
 
+ds_publish_payloads(MS = #model_state{runtime = RS0 = {WS0, _, _}}, BatchSize, SeqNoError) ->
+    #world_stage{ds_subs = DSSubs0} = WS0,
+    EffHandler = fake_world(MS),
+    {DSSubs, {WS1, CS, HS}} = lists:mapfoldl(
+        fun(DSSub = #test_ds_sub{sref = SRef, it = It0, seqno = SeqNo0}, RS1) ->
+            #fake_iter{stream = #fake_stream{shard = Shard, gen = Gen}} = It0,
+            Msg =
+                case current_gen(Shard, MS) > Gen of
+                    true ->
+                        SeqNo = SeqNo0 + 1 + SeqNoError,
+                        #ds_sub_reply{
+                            ref = SRef,
+                            payload = {ok, end_of_stream},
+                            size = 1,
+                            seqno = SeqNo
+                        };
+                    false ->
+                        SeqNo = SeqNo0 + BatchSize + SeqNoError,
+                        %% TODO: make data more realistic:
+                        It = It0,
+                        TTVs = [],
+                        #ds_sub_reply{
+                            ref = SRef,
+                            payload = {ok, It, TTVs},
+                            size = BatchSize,
+                            seqno = SeqNo
+                        }
+                end,
+            {DSSub#test_ds_sub{seqno = SeqNo}, dispatch_message(Msg, EffHandler, RS1)}
+        end,
+        RS0,
+        DSSubs0
+    ),
+    WS = WS1#world_stage{ds_subs = DSSubs},
+    {WS, CS, HS}.
+
 fix_all_errors(#model_state{runtime = RS}) ->
     RS.
 
@@ -887,33 +940,6 @@ inject_error(#model_state{runtime = RS}, _Shard, _Mask) ->
 
 fix_error(#model_state{runtime = RS}, _Shard, _Mask) ->
     RS.
-
-dispatch_message(Message, EffectHandler, {WS, CS0, HS0}) ->
-    Result = emqx_ds_client:do_dispatch_message(Message, CS0, HS0),
-    prop_dispatch_result(Message, CS0, Result),
-    case Result of
-        ignore ->
-            {WS, CS0, HS0};
-        {data, SubId, Reply} ->
-            {data, SubId, Reply},
-            %% FIXME: update HS
-            {WS, CS0, HS0};
-        {Field, CS, HS} ->
-            execute(EffectHandler, Field, WS, CS, HS)
-    end.
-
-execute_planned(MS = #model_state{runtime = {WS, CS, HS}}) ->
-    execute(fake_world(MS), #cs.plan, WS, CS, HS).
-
-execute(EffectHandler, Field, WS, CS, HS) ->
-    emqx_ds_client:execute(
-        Field,
-        EffectHandler,
-        WS,
-        fun emqx_ds_client:result_handler/4,
-        CS,
-        HS
-    ).
 
 %%------------------------------------------------------------------------------
 %% Helper functions
@@ -944,6 +970,33 @@ wrapper(MS0, Fun, Args) ->
                 RS
             )
     end.
+
+dispatch_message(Message, EffectHandler, {WS, CS0, HS0}) ->
+    Result = emqx_ds_client:do_dispatch_message(Message, CS0, HS0),
+    prop_dispatch_result(Message, CS0, Result),
+    case Result of
+        ignore ->
+            {WS, CS0, HS0};
+        {data, SubId, Reply} ->
+            {data, SubId, Reply},
+            %% FIXME: update HS
+            {WS, CS0, HS0};
+        {Field, CS, HS} ->
+            execute(EffectHandler, Field, WS, CS, HS)
+    end.
+
+execute_planned(MS = #model_state{runtime = {WS, CS, HS}}) ->
+    execute(fake_world(MS), #cs.plan, WS, CS, HS).
+
+execute(EffectHandler, Field, WS, CS, HS) ->
+    emqx_ds_client:execute(
+        Field,
+        EffectHandler,
+        WS,
+        fun emqx_ds_client:result_handler/4,
+        CS,
+        HS
+    ).
 
 %%------------------------------------------------------------------------------
 %% Effect handler

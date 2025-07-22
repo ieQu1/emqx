@@ -11,12 +11,18 @@
     ds_sub_opts :: emqx_ds:sub_opts()
 }).
 
+-define(ds_sub_a_seqno, 1).
+-define(ds_sub_a_stuck, 2).
+-define(ds_sub_a_lagging, 3).
+
 -record(ds_sub, {
     id :: emqx_ds_client:sub_id(),
-    handle :: emqx_ds:subscription_handle(),
     slab :: emqx_ds:slab(),
+    db :: emqx_ds:db(),
     stream :: emqx_ds:stream(),
-    db :: emqx_ds:db()
+    handle :: emqx_ds:subscription_handle(),
+    %% SeqNo, Stuck, Lagging:
+    vars = atomics:new(3, [{signed, false}]) :: atomics:atomics_ref()
 }).
 
 -record(stream_cache, {
