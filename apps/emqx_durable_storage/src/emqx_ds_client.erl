@@ -70,7 +70,7 @@ Host must pass all unknown received messages into `dispatch_message/3` function.
 -type effects() :: [effect()].
 
 -doc """
-Global state of the client. It encapsulatees states of all active subscriptions.
+Global state of the client. It encapsulates states of all active subscriptions.
 """.
 -opaque t() :: #cs{}.
 
@@ -312,7 +312,7 @@ handle_ds_sub_unrecoverable_error_(Reason, CS0, SRef, DSSub, HS) ->
     #cs{cbm = CBM} = CS0,
     #ds_sub{id = SubId, db = DB, handle = Handle, stream = Stream, slab = Slab} =
         DSSub,
-    ?tp(error, emqx_ds_client_read_failure, #{
+    ?tp(info, emqx_ds_client_read_failure, #{
         unrecoverable => Reason,
         sub_id => SubId,
         db => DB,
@@ -568,7 +568,7 @@ handle_make_iterator_fail(Eff, CS = #cs{cbm = CBM}, HostState, Err) ->
     #eff_make_iterator{
         sub_id = SubId, db = DB, slab = Slab, stream = Stream, topic = Topic, start_time = StartTime
     } = Eff,
-    ?tp(error, emqx_ds_client_make_iterator_fail, #{
+    ?tp(info, emqx_ds_client_make_iterator_fail, #{
         unrecoverable => Err,
         sub_id => SubId,
         db => DB,

@@ -204,7 +204,6 @@ get_iterator(SubId, _Slab, Stream, #test_host_state{iterators = Its}) ->
 %%================================================================================
 
 -define(test_sub_ids, [id1, id2]).
-%-define(test_sub_ids, [id1]).
 
 -define(err_get_streams, err_get_streams).
 -define(err_make_iterator, err_make_iterator).
@@ -222,7 +221,7 @@ get_iterator(SubId, _Slab, Stream, #test_host_state{iterators = Its}) ->
     %% Active watches:
     watches = [] :: [?watch_ref(_, _)],
     %% Active subscriptions:
-    ds_subs = [] :: [{?sub_ref(_, _), _It}]
+    ds_subs = [] :: [#test_ds_sub{}]
 }).
 
 %% Model state (updated by proper command generator):
@@ -319,6 +318,13 @@ gen_fix_error(MS) ->
 gen_fix_all_errors(MS) ->
     exactly(?call_wrapper(MS, fix_all_errors, [])).
 
+gen_ds_sub_recoverable_error(MS) ->
+    ?LET(
+        Reason,
+        oneof(['DOWN', ?err_rec(simulated)]),
+        ?call_wrapper(MS, ds_sub_recoverable_error, [Reason])
+    ).
+
 %%------------------------------------------------------------------------------
 %% Proper statem callbacks
 %%------------------------------------------------------------------------------
@@ -328,10 +334,11 @@ initial_state() ->
 
 command(MS = #model_state{exists = false}) ->
     gen_new(MS);
-command(MS = #model_state{err_rec = Errors}) ->
+command(MS = #model_state{err_rec = Errors, subs = Subs}) ->
     frequency(
         [{3, gen_fix_all_errors(MS)} || maps:size(Errors) > 0] ++
             [{3, gen_fix_error(MS)} || maps:size(Errors) > 0] ++
+            [{2, gen_ds_sub_recoverable_error(MS)} || maps:size(Subs) > 0] ++
             [
                 {3, gen_inject_error(MS)},
                 {1, gen_destroy(MS)},
@@ -385,6 +392,8 @@ next_state_(MS = #model_state{err_rec = Errors}, inject_error, [Shard, ErrorType
     MS#model_state{
         err_rec = Errors#{{Shard, ErrorType} => true}
     };
+next_state_(MS, ds_sub_recoverable_error, _) ->
+    MS;
 next_state_(MS = #model_state{err_rec = Errors}, fix_error, [Shard, ErrorType]) ->
     MS#model_state{
         err_rec = maps:remove({Shard, ErrorType}, Errors)
@@ -441,15 +450,8 @@ run_proper() ->
                 ),
                 begin
                     {_History, _State, Result} = proper_statem:run_commands(?MODULE, Cmds),
-                    ?assertMatch(ok, Result)
-                    %% ?WHENFAIL(
-                    %%     io:format(
-                    %%         user,
-                    %%         "Commands:~n~s~nState: ~p\nResult: ~p~n",
-                    %%         [format_cmds(Cmds), pprint_mstate(State), Result]
-                    %%     ),
-                    %%     aggregate(command_names(Cmds), Result =:= ok)
-                    %% )
+                    ?assertMatch(ok, Result),
+                    aggregate(command_names(Cmds), true)
                 end,
                 []
             ),
@@ -626,6 +628,8 @@ prop_dispatch_result(Msg = #ds_sub_reply{ref = Ref}, CS, Result) ->
         {_, _, _} when IsSub ->
             ok;
         {data, _SubId, #ds_sub_reply{}} when IsSub ->
+            ok;
+        ignore when not IsSub ->
             ok;
         _ ->
             error(
@@ -810,7 +814,7 @@ add_generation(#model_state{runtime = RS}, _Shard, _Generation) ->
 %% Dispatch 'DOWN' messages for all subscriptions to streams that no
 %% longer exist:
 del_generation(
-    MS0 = #model_state{streams = Streams, runtime = RS0 = {WS, _, _}}, Shard, Generation, Graceful
+    MS0 = #model_state{streams = Streams, runtime = RS0 = {WS, _, _}}, _Shard, _Generation, Graceful
 ) ->
     EffHandler = fake_world(MS0),
     Reason =
@@ -829,6 +833,18 @@ del_generation(
         end,
         RS0,
         WS#world_stage.ds_subs
+    ).
+
+ds_sub_recoverable_error(MS = #model_state{runtime = RS0 = {WS, _, _}}, Reason) ->
+    %% Emulate all DS subscriptions going down:
+    #world_stage{ds_subs = DSSubs} = WS,
+    EffHandler = fake_world(MS),
+    lists:foldl(
+        fun(#test_ds_sub{sref = SRef}, RS) ->
+            destroy_ds_sub(EffHandler, SRef, RS, Reason)
+        end,
+        RS0,
+        DSSubs
     ).
 
 destroy_ds_sub(EffHandler, SRef, {WS0 = #world_stage{ds_subs = DSSubs0}, CS, HS}, Reason) ->
@@ -868,6 +884,7 @@ fix_all_errors(#model_state{runtime = RS}) ->
 
 inject_error(#model_state{runtime = RS}, _Shard, _Mask) ->
     RS.
+
 fix_error(#model_state{runtime = RS}, _Shard, _Mask) ->
     RS.
 
@@ -1004,7 +1021,6 @@ fake_world(#model_state{
                         }
                     };
                 false ->
-                    %% Simulate unrecoverable errors too?
                     {
                         ?err_rec(simulated),
                         Stage
