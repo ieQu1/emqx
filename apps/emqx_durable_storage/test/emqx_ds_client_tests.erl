@@ -183,6 +183,14 @@ on_new_iterator(
     },
     {subscribe, HS}.
 
+on_unrecoverable_error(SubId, _Slab, Stream, Reason, HS = #test_host_state{}) ->
+    ?tp(test_host_unrecoverable, #{subid => SubId, stream => Stream, reason => Reason}),
+    HS.
+
+on_subscription_down(SubId, _Slab, Stream, HS) ->
+    ?tp(test_host_sub_down, #{subid => SubId, stream => Stream}),
+    HS.
+
 get_iterator(SubId, _Slab, Stream, #test_host_state{iterators = Its}) ->
     case Its of
         #{{SubId, Stream} := It} ->
@@ -330,7 +338,7 @@ command(MS = #model_state{err_rec = Errors}) ->
                 {3, gen_subscribe(MS)},
                 {2, gen_unsubscribe(MS)},
                 {5, gen_add_generation(MS)},
-                %% {1, gen_del_generation(MS)},
+                {1, gen_del_generation(MS)},
                 {5, gen_add_stream(MS)}
             ]
     ).
@@ -565,9 +573,9 @@ prop_ownership(#model_state{runtime = {WS, GS, _}}) ->
     true.
 
 %% This function verifies result of `emqx_ds_client:dispatch' function.
--spec prop_dispatch_result(_Message, #world_stage{}, emqx_ds_client:t(), _DispatchResult) -> ok.
+-spec prop_dispatch_result(_Message, emqx_ds_client:t(), _DispatchResult) -> ok.
 prop_dispatch_result(
-    #emqx_ds_client_retry{ref = Ref}, _WS, CS = #cs{ref = CRef, retry_tref = TRef}, Result
+    #emqx_ds_client_retry{ref = Ref}, CS = #cs{ref = CRef, retry_tref = TRef}, Result
 ) ->
     case Result of
         {_, _, _} when is_reference(TRef), Ref =:= CRef ->
@@ -579,11 +587,9 @@ prop_dispatch_result(
         _ ->
             error({unexpected_retry, #{result => Result, ref => Ref, state => CS}})
     end;
-prop_dispatch_result(
-    #new_stream_event{subref = W}, _WS, #cs{new_streams_watches = Watches}, Result
-) ->
-    case Watches of
-        #{W := _} ->
+prop_dispatch_result(#new_stream_event{subref = W}, CS, Result) ->
+    case maps:is_key(W, CS#cs.new_streams_watches) of
+        true ->
             ?assertMatch(
                 {_, _, _},
                 Result,
@@ -592,14 +598,46 @@ prop_dispatch_result(
                 notification for an existing watch
                 """
             );
-        #{} ->
+        false ->
             ?assertMatch(
                 ignore,
                 Result,
                 "Client should ignore unknown stream notifications"
             )
     end;
-prop_dispatch_result(Message, _, Client, Result) ->
+prop_dispatch_result({'DOWN', MRef, _, _, _}, CS, Result) ->
+    case maps:is_key(MRef, CS#cs.ds_subs) of
+        true ->
+            ?assertMatch(
+                {_, _, _},
+                Result,
+                "Client should update its state when a DS subscription dies"
+            );
+        false ->
+            ?assertMatch(
+                ignore,
+                Result,
+                "Client should ignore stray DOWN messages"
+            )
+    end;
+prop_dispatch_result(Msg = #ds_sub_reply{ref = Ref}, CS, Result) ->
+    IsSub = maps:is_key(Ref, CS#cs.ds_subs),
+    case Result of
+        {_, _, _} when IsSub ->
+            ok;
+        {data, _SubId, #ds_sub_reply{}} when IsSub ->
+            ok;
+        _ ->
+            error(
+                {"Invalid response from dispatch_message function", #{
+                    msg => Msg,
+                    is_owned => IsSub,
+                    state => emqx_ds_client:inspect(CS),
+                    result => Result
+                }}
+            )
+    end;
+prop_dispatch_result(Message, Client, Result) ->
     error(
         {"Invalid response from dispatch_message function", #{
             msg => Message,
@@ -835,7 +873,7 @@ fix_error(#model_state{runtime = RS}, _Shard, _Mask) ->
 
 dispatch_message(Message, EffectHandler, {WS, CS0, HS0}) ->
     Result = emqx_ds_client:do_dispatch_message(Message, CS0, HS0),
-    prop_dispatch_result(Message, WS, CS0, Result),
+    prop_dispatch_result(Message, CS0, Result),
     case Result of
         ignore ->
             {WS, CS0, HS0};

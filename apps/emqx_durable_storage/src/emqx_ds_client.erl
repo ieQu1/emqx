@@ -127,8 +127,19 @@ Notify the host about creation of a new iterator.
 Notify the host that operation with the stream (creation of iterator or subscription) failed unrecoverably.
 Client will make no further attempts to interact with the stream.
 """.
--callback on_make_iterator_fail(sub_id(), emqx_ds:slab(), emqx_ds:stream(), _Error, HostState) ->
+-callback on_unrecoverable_error(sub_id(), emqx_ds:slab(), emqx_ds:stream(), _Error, HostState) ->
     HostState.
+
+-doc """
+Notify the host about a transient error with a DS subscription.
+
+After execution of this function the host should expect that the client will restart replay from the position
+specified by `get_iterator` callback.
+
+The purpose of this callback is to prevent duplication of messages.
+For example, if the host is caching stream messages, it should drop the cache.
+""".
+-callback on_subscription_down(sub_id(), emqx_ds:slab(), emqx_ds:stream(), HostState) -> HostState.
 
 %%================================================================================
 %% API functions
@@ -267,48 +278,53 @@ do_dispatch_message(
 do_dispatch_message(_, _, _) ->
     ignore.
 
-handle_ds_sub_message_({'DOWN', _, Type, Pid, Reason}, CS0, SRef, DSSub, HostState) ->
+handle_ds_sub_message_(Reason = {'DOWN', _, _, _, _}, CS, SRef, DSSub, HS) ->
+    handle_ds_sub_recoverable_error_(Reason, CS, SRef, DSSub, HS);
+handle_ds_sub_message_(#ds_sub_reply{payload = ?err_rec(Reason)}, CS, SRef, DSSub, HS) ->
+    handle_ds_sub_recoverable_error_(Reason, CS, SRef, DSSub, HS);
+handle_ds_sub_message_(#ds_sub_reply{payload = ?err_unrec(Reason)}, CS, SRef, DSSub, HS) ->
+    handle_ds_sub_unrecoverable_error_(Reason, CS, SRef, DSSub, HS).
+
+handle_ds_sub_recoverable_error_(Reason, CS0, SRef, DSSub, HS0) ->
+    #cs{cbm = CBM} = CS0,
     #ds_sub{id = SubId, db = DB, handle = Handle, stream = Stream, slab = Slab = {Shard, _Gen}} =
         DSSub,
     ?tp(
         info,
         emqx_ds_client_subscription_down,
         #{
-            Type => Pid,
             reason => Reason,
             sub_id => SubId,
             stream => Stream
         }
     ),
-    %% This effect will also crean the state:
+    %% Notify host about subscription down:
+    HS1 = on_subscription_down(CBM, SubId, Slab, Stream, HS0),
+    %% Unsubscribe. Even if the subscription is already dead, it'll
+    %% remove it from the registry.
     CS1 = plan(#eff_ds_unsub{ref = SRef, db = DB, handle = Handle}, CS0),
-    CS = with_stream_cache(
-        SubId,
-        Shard,
-        CS1,
-        fun(Cache0 = #stream_cache{active = Active}) ->
-            %% Look up sub options:
-            #{SubId := #sub{ds_sub_opts = SubOpts}} = CS0#cs.subs,
-            %% FIXME: ask host instead.
-            #{Stream := {It, _}} = Active,
-            CS2 = plan(
-                #eff_ds_sub{
-                    sub_id = SubId,
-                    db = DB,
-                    slab = Slab,
-                    stream = Stream,
-                    iterator = It,
-                    sub_options = SubOpts
-                },
-                CS1
-            ),
-            Cache = Cache0#stream_cache{
-                active = Active#{Stream => {It, undefined}}
-            },
-            {Cache, CS2}
-        end
-    ),
-    {#cs.plan, CS, HostState}.
+    %% Re-add stream:
+    CS2 = forget_stream(CS1, SubId, Slab, Stream),
+    {CS, HS} = update_streams(CS2, SubId, Shard, [{Slab, Stream}], HS1),
+    {#cs.plan, CS, HS}.
+
+handle_ds_sub_unrecoverable_error_(Reason, CS0, SRef, DSSub, HS) ->
+    #cs{cbm = CBM} = CS0,
+    #ds_sub{id = SubId, db = DB, handle = Handle, stream = Stream, slab = Slab} =
+        DSSub,
+    ?tp(error, emqx_ds_client_read_failure, #{
+        unrecoverable => Reason,
+        sub_id => SubId,
+        db => DB,
+        slab => Slab,
+        stream => Stream
+    }),
+    CS = plan(#eff_ds_unsub{ref = SRef, db = DB, handle = Handle}, CS0),
+    {
+        #cs.plan,
+        forget_stream(CS, SubId, Slab, Stream),
+        on_unrecoverable_error(CBM, SubId, Slab, Stream, Reason, HS)
+    }.
 
 -spec destroy_(t()) -> t().
 destroy_(CS0 = #cs{retry_tref = TRef}) ->
@@ -509,8 +525,9 @@ handle_new_ds_sub(Eff, CS0, Handle, SubRef) ->
     DSSub = #ds_sub{
         id = SubId,
         handle = Handle,
-        stream = Stream,
-        db = DB
+        db = DB,
+        slab = Slab,
+        stream = Stream
     },
     CS#cs{
         ds_subs = DSSubs#{SubRef => DSSub}
@@ -562,7 +579,7 @@ handle_make_iterator_fail(Eff, CS = #cs{cbm = CBM}, HostState, Err) ->
     }),
     {
         forget_stream(CS, SubId, Slab, Stream),
-        on_make_iterator_fail(CBM, SubId, Slab, Stream, Err, HostState)
+        on_unrecoverable_error(CBM, SubId, Slab, Stream, Err, HostState)
     }.
 
 -spec real_world(effect(), undefined) -> {_Result, undefined}.
@@ -635,7 +652,7 @@ forget_stream(CS, SubId, {Shard, Gen}, Stream) ->
                     pending_iterator = Pending -- [Stream],
                     active = maps:remove(Stream, Active),
                     replayed = maps:remove(Stream, Replayed),
-                    future = gb_sets:delete({Gen, Stream}, Future)
+                    future = gb_sets:delete_any({Gen, Stream}, Future)
                 }
         end
     ).
@@ -1014,17 +1031,22 @@ get_iterator(CBM, SubId, Slab, Stream, HostState) ->
 on_new_iterator(CBM, SubId, Slab, Stream, Iterator, HostState) ->
     CBM:on_new_iterator(SubId, Slab, Stream, Iterator, HostState).
 
--spec on_make_iterator_fail(
+-spec on_unrecoverable_error(
     module(), sub_id(), emqx_ds:slab(), emqx_ds:stream(), _Error, HostState
 ) ->
     HostState.
-on_make_iterator_fail(CBM, SubId, Slab, Stream, Error, HostState) ->
-    CBM:on_make_iterator_fail(SubId, Slab, Stream, Error, HostState).
+on_unrecoverable_error(CBM, SubId, Slab, Stream, Error, HostState) ->
+    CBM:on_unrecoverable_error(SubId, Slab, Stream, Error, HostState).
 
 -spec on_advance_generation(module(), sub_id(), emqx_ds:shard(), emqx_ds:generation(), HostState) ->
     HostState.
 on_advance_generation(CBM, SubId, Shard, NewCurrentGeneration, HostState) ->
     CBM:on_advance_generation(SubId, Shard, NewCurrentGeneration, HostState).
+
+-spec on_subscription_down(module(), sub_id(), emqx_ds:slab(), emqx_ds:stream(), HostState) ->
+    HostState.
+on_subscription_down(CBM, SubId, Slab, Stream, HostState) ->
+    CBM:on_subscription_down(SubId, Slab, Stream, HostState).
 
 %%------------------------------------------------------------------------------
 %% Misc.
