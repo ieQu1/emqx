@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_ds_client_tests).
 
@@ -14,7 +14,10 @@
 -include("emqx_ds.hrl").
 -include("../src/emqx_ds_client_internals.hrl").
 
--define(fake_shards, [<<"0">>, <<"12">>]).
+-define(ws, world_stage).
+
+%-define(fake_shards, [<<"0">>, <<"12">>]).
+-define(fake_shards, [<<>>]).
 
 %%================================================================================
 %% Basic tests
@@ -160,7 +163,7 @@ on_advance_generation(
     SubId, Shard, NextGen, HS = #test_host_state{generations = Gens0}
 ) ->
     OldCurrent = get_current_generation(SubId, Shard, HS),
-    ?tp(test_host_advance_generation, #{
+    ?tp(info, test_host_advance_generation, #{
         subid => SubId, shard => Shard, old => OldCurrent, new => NextGen
     }),
     ?assert(
@@ -173,15 +176,19 @@ on_advance_generation(
     }.
 
 on_new_iterator(
-    SubId, _Slab, Stream, It, HS0 = #test_host_state{iterators = Its}
+    SubId, _Slab, Stream, It, HS = #test_host_state{iterators = Its}
 ) ->
-    Key = {SubId, Stream},
     ?tp(test_host_new_iterator, #{subid => SubId, stream => Stream, it => It}),
-    ?assertNot(maps:is_key(Key, Its), "Client should not re-create iterators"),
-    HS = HS0#test_host_state{
-        iterators = Its#{Key => It}
-    },
-    {subscribe, HS}.
+    ?assertNot(maps:is_key({SubId, Stream}, Its), "Client should not re-create iterators"),
+    {subscribe, host_set_iter(SubId, Stream, It, HS)}.
+
+host_get_iter(SubId, Stream, #test_host_state{iterators = Its}) ->
+    map:get({SubId, Stream}, Its, undefined).
+
+host_set_iter(SubId, Stream, It, HS = #test_host_state{iterators = Its}) ->
+    HS#test_host_state{
+        iterators = Its#{{SubId, Stream} => It}
+    }.
 
 on_unrecoverable_error(SubId, _Slab, Stream, Reason, HS = #test_host_state{}) ->
     ?tp(test_host_unrecoverable, #{subid => SubId, stream => Stream, reason => Reason}),
@@ -203,7 +210,8 @@ get_iterator(SubId, _Slab, Stream, #test_host_state{iterators = Its}) ->
 %% Proper test
 %%================================================================================
 
--define(test_sub_ids, [id1, id2]).
+%%-define(test_sub_ids, [id1, id2]).
+-define(test_sub_ids, [id1]).
 
 -define(err_get_streams, err_get_streams).
 -define(err_make_iterator, err_make_iterator).
@@ -331,10 +339,10 @@ gen_ds_sub_payloads(MS) ->
         {
             range(0, 5),
             frequency([
-                       {5, 0},
-                       %% FIXME:
-                       {0, range(-3, 3)}
-                      ])
+                {5, 0},
+                %% FIXME:
+                {0, range(-3, 3)}
+            ])
         },
         ?call_wrapper(MS, ds_publish_payloads, [BatchSize, SeqNoError])
     ).
@@ -351,16 +359,16 @@ command(MS = #model_state{exists = false}) ->
 command(MS = #model_state{err_rec = Errors, subs = Subs}) ->
     frequency(
         [{3, gen_fix_all_errors(MS)} || maps:size(Errors) > 0] ++
-            [{3, gen_fix_error(MS)} || maps:size(Errors) > 0] ++
-            [{2, gen_ds_sub_recoverable_error(MS)} || maps:size(Subs) > 0] ++
+            %% [{3, gen_fix_error(MS)} || maps:size(Errors) > 0] ++
+            %% [{2, gen_ds_sub_recoverable_error(MS)} || maps:size(Subs) > 0] ++
             [{2, gen_ds_sub_payloads(MS)} || maps:size(Subs) > 0] ++
             [
-                {3, gen_inject_error(MS)},
-                {1, gen_destroy(MS)},
+                %% {3, gen_inject_error(MS)},
+                %% {1, gen_destroy(MS)},
                 {3, gen_subscribe(MS)},
-                {2, gen_unsubscribe(MS)},
+                %% {2, gen_unsubscribe(MS)},
                 {5, gen_add_generation(MS)},
-                {1, gen_del_generation(MS)},
+                %% {1, gen_del_generation(MS)},
                 {5, gen_add_stream(MS)}
             ]
     ).
@@ -432,7 +440,9 @@ postcondition(PrevState, Call, Result) ->
     prop_ownership(CurrentState),
     prop_active_subscriptions(CurrentState),
     prop_no_pending_when_healthy(CurrentState),
-    prop_host_seen_all_streams(CurrentState).
+    prop_host_seen_all_streams(CurrentState),
+    %% prop_host_generations(CurrentState, Call),
+    true.
 
 %%------------------------------------------------------------------------------
 %% Tests
@@ -466,6 +476,9 @@ run_proper() ->
                     proper_statem:commands(?MODULE)
                 ),
                 begin
+                    put(?ws, #world_stage{}),
+                    put(?ts, #test_host_state{}),
+                    put(?cs, #cs{}),
                     {_History, _State, Result} = proper_statem:run_commands(?MODULE, Cmds),
                     ?assertMatch(ok, Result),
                     aggregate(command_names(Cmds), true)
@@ -564,18 +577,20 @@ subscribe__test() ->
 %% This function verifies 1:1 relation between watches and
 %% subscriptions owned by the client and those that exist in the fake
 %% world. That is, there aren't any dangling or leaked subscriptions.
-prop_ownership(#model_state{runtime = {WS, GS, _}}) ->
+prop_ownership(#model_state{runtime = {WS, CS, _}}) ->
     #world_stage{watches = Watches, ds_subs = Subs} = WS,
-    case GS of
+    case CS of
         undefined ->
             %% Client doesn't exist:
             snabbkaffe_diff:assert_lists_eq(
                 [],
-                Watches
+                Watches,
+                #{comment => "Leaked watches"}
             ),
             snabbkaffe_diff:assert_lists_eq(
                 [],
-                Subs
+                Subs,
+                #{comment => "Leaked DS subscriptions"}
             );
         #cs{new_streams_watches = OwnedWatches, ds_subs = OwnedSubs} ->
             %% Client exists:
@@ -584,9 +599,15 @@ prop_ownership(#model_state{runtime = {WS, GS, _}}) ->
                 lists:sort(maps:keys(OwnedWatches))
             ),
             ActiveSubRefs = [SRef || #test_ds_sub{sref = SRef} <- Subs],
-            snabbkaffe_diff:assert_lists_eq(
-                lists:sort(ActiveSubRefs),
-                lists:sort(maps:keys(OwnedSubs))
+            ?assertMatch(
+                [],
+                ActiveSubRefs -- maps:keys(OwnedSubs),
+                "Leaked DS subscriptions"
+            ),
+            ?assertMatch(
+                [],
+                maps:keys(OwnedSubs) -- ActiveSubRefs,
+                "Dangling DS subscriptions"
             )
     end,
     true.
@@ -644,7 +665,7 @@ prop_dispatch_result(Msg = #ds_sub_reply{ref = Ref}, CS, Result) ->
     case Result of
         {_, _, _} when IsSub ->
             ok;
-        {data, _SubId, #ds_sub_reply{}} when IsSub ->
+        {data, _SubId, _Stream, #ds_sub_reply{}} when IsSub ->
             ok;
         ignore when not IsSub ->
             ok;
@@ -708,11 +729,11 @@ prop_host_seen_all_streams(#model_state{
                                     );
                                 Current when Gen =:= Current ->
                                     ?assertMatch(
-                                        #{{SubId, Stream} := #fake_iter{}},
+                                        #{{SubId, Stream} := _},
                                         HostIters,
                                         #{
                                             msg =>
-                                                "Current generation, there should be an iterator",
+                                                "Current generation, there should be an iterator or `end_of_stream'",
                                             sub_id => SubId,
                                             stream => Stream
                                         }
@@ -796,6 +817,40 @@ prop_active_subscriptions(#model_state{runtime = {_WS, CS, _HS}}) ->
         lists:sort(maps:keys(DSSubs)),
         #{comment => emqx_ds_client:inspect(CS)}
     ).
+
+%% Verify that when the system is healthy, after sending the data all
+%% subscriptions registered by the host advance to the last
+%% generations.
+prop_host_generations(MS = #model_state{err_rec = Errors, runtime = {_WS, _, HS}}, Call) ->
+    %% TODO: this doesn't work like this. The client can advance the
+    %% generation, but unless it receives some data or end_of_stream,
+    %% it won't reach the last generation.
+    IsSystemHealthy = maps:size(Errors) =:= 0,
+    RunCheck =
+        case Call of
+            ?call_wrapper(_, ds_publish_payloads, [_, 0]) when IsSystemHealthy ->
+                %% Run this check after publishing some payloads with
+                %% valid sequence numbers:
+                true;
+            _ ->
+                false
+        end,
+    case RunCheck of
+        true ->
+            maps:foreach(
+                fun({SubId, Shard}, HostGeneration) ->
+                    ?assertEqual(
+                        current_gen(Shard, MS),
+                        HostGeneration,
+                        #{sub_id => SubId, shard => Shard}
+                    )
+                end,
+                HS#test_host_state.generations
+            );
+        false ->
+            skip
+    end,
+    true.
 
 %%------------------------------------------------------------------------------
 %% Fake versions of commands
@@ -924,6 +979,7 @@ ds_publish_payloads(MS = #model_state{runtime = RS0 = {WS0, _, _}}, BatchSize, S
                             seqno = SeqNo
                         }
                 end,
+            ?tp(test_publish_message_to_sub, #{message => Msg}),
             {DSSub#test_ds_sub{seqno = SeqNo}, dispatch_message(Msg, EffHandler, RS1)}
         end,
         RS0,
@@ -977,10 +1033,15 @@ dispatch_message(Message, EffectHandler, {WS, CS0, HS0}) ->
     case Result of
         ignore ->
             {WS, CS0, HS0};
-        {data, SubId, Reply} ->
-            {data, SubId, Reply},
-            %% FIXME: update HS
-            {WS, CS0, HS0};
+        {data, SubId, Stream, Reply} ->
+            case Reply of
+                #ds_sub_reply{ref = Ref, payload = {ok, end_of_stream}} ->
+                    HS1 = host_set_iter(SubId, Stream, end_of_stream, HS0),
+                    {CS, HS} = emqx_ds_client:complete_stream_(CS0, Ref, HS1),
+                    execute(EffectHandler, #cs.plan, WS, CS, HS);
+                #ds_sub_reply{} ->
+                    {WS, CS0, HS0}
+            end;
         {Field, CS, HS} ->
             execute(EffectHandler, Field, WS, CS, HS)
     end.

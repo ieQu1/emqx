@@ -13,10 +13,15 @@ It doesn't spawn new processes, and is designed to be embedded in
 a process (host) that handles the business logic.
 
 Host must pass all unknown received messages into `dispatch_message/3` function.
+
+NOTE: The client does NOT ack DS batches.
+Host MUST call `emqx_ds:suback` function when it's done processing the batch.
 """.
 
 %% API:
--export([new/2, destroy/2, subscribe/3, unsubscribe/3, dispatch_message/3, inspect/1]).
+-export([
+    new/2, destroy/2, subscribe/3, unsubscribe/3, dispatch_message/3, complete_stream/3, inspect/1
+]).
 
 -export_type([sub_id/0, t/0, sub_options/0]).
 
@@ -211,7 +216,7 @@ Generally, all messages received by the process should be passed into this funct
 If atom `ignore` is returned, the message was not addressed to the client and should be processed elsewhere.
 """.
 -spec dispatch_message(t(), term(), HostState) ->
-    ignore | {t(), HostState} | {data, sub_id(), #ds_sub_reply{}}.
+    ignore | {t(), HostState} | {data, sub_id(), emqx_ds:stream(), #ds_sub_reply{}}.
 dispatch_message(CS0, Message, HS0) ->
     case do_dispatch_message(Message, CS0, HS0) of
         ignore ->
@@ -221,6 +226,11 @@ dispatch_message(CS0, Message, HS0) ->
         {Field, CS, HS} ->
             execute(Field, CS, HS)
     end.
+
+-spec complete_stream(t(), emqx_ds:sub_ref(), HostState) -> {t(), HostState}.
+complete_stream(CS0, SRef, HS0) ->
+    {CS, HS} = complete_stream_(CS0, SRef, HS0),
+    execute(#cs.plan, CS, HS).
 
 -doc """
 Pretty-print state of the client.
@@ -236,10 +246,35 @@ inspect(CS = #cs{streams = Streams, ds_subs = DSSubs}) ->
 %% Internal functions
 %%================================================================================
 
+-spec complete_stream_(t(), emqx_ds:sub_ref(), HostState) -> {t(), HostState}.
+complete_stream_(CS0 = #cs{ds_subs = DSSubs}, SRef, HS) ->
+    case DSSubs of
+        #{SRef := DSSub} ->
+            #ds_sub{id = SubId, db = DB, handle = Handle, slab = {Shard, _}, stream = Stream} = DSSub,
+            with_stream_cache(
+                SubId,
+                Shard,
+                CS0,
+                HS,
+                fun(Cache0 = #stream_cache{active = Active, replayed = Replayed}) ->
+                    %% 1. Unsubscribe
+                    CS1 = plan(#eff_ds_unsub{ref = SRef, db = DB, handle = Handle}, CS0),
+                    %% 2. Remove stream from active and move it to replayed:
+                    Cache = Cache0#stream_cache{
+                        replayed = Replayed#{Stream => true},
+                        active = maps:remove(Stream, Active)
+                    },
+
+                end
+            );
+        #{} ->
+            {CS0, HS}
+    end.
+
 -spec do_dispatch_message(_Message, t(), HostState) ->
     {integer(), t(), HostState}
     | ignore
-    | {data, sub_id(), #ds_sub_reply{}}.
+    | {data, sub_id(), emqx_ds:stream(), #ds_sub_reply{}}.
 do_dispatch_message(
     {'DOWN', MRef, _, _, _} = Msg,
     CS0 = #cs{ds_subs = DSSubs},
@@ -286,19 +321,23 @@ handle_ds_sub_message_(#ds_sub_reply{payload = ?err_unrec(Reason)}, CS, SRef, DS
     handle_ds_sub_unrecoverable_error_(Reason, CS, SRef, DSSub, HS);
 handle_ds_sub_message_(
     Data = #ds_sub_reply{
-        payload = Payload, seqno = SeqNo, size = Size, stuck = Stuck, lagging = Lagging
+        seqno = SeqNo, size = Size, stuck = Stuck, lagging = Lagging
     },
     CS,
     SRef,
-    DSSub = #ds_sub{id = SubId, vars = Vars},
+    DSSub = #ds_sub{id = SubId, vars = Vars, stream = Stream},
     HS
 ) ->
+    %% Verify sequence numbers:
     case atomics:add_get(Vars, ?ds_sub_a_seqno, Size) of
         SeqNo ->
             %% Match:
             atomics:put(Vars, ?ds_sub_a_stuck, sub_reply_flag_to_int(Stuck)),
             atomics:put(Vars, ?ds_sub_a_lagging, sub_reply_flag_to_int(Lagging)),
-            {data, SubId, Data};
+            %% Note: even if the payload contains `end_of_stream' we
+            %% cannot advance generation just yet. This will be done
+            %% after client's ack.
+            {data, SubId, Stream, Data};
         WrongSeqNo ->
             %% Mismatch:
             handle_ds_sub_recoverable_error_(
@@ -759,8 +798,8 @@ add_stream_to_cache(
             ?tp(debug, emqx_ds_client_new_stream, #{sub => SubId, shard => Shard, stream => Stream}),
             %% Does the host already have the iterator?
             case get_iterator(CS0#cs.cbm, SubId, {Shard, Generation}, Stream, HostState) of
-                {ok, end_of_stream} ->
-                    %% This is a known replayed stream:
+                {Action, end_of_stream} when Action =:= ok; Action =:= subscribe ->
+                    %% This is a known replayed stream.
                     Cache = Cache0#stream_cache{replayed = Replayed#{Stream => true}},
                     {CS0, Cache};
                 undefined ->
@@ -992,8 +1031,9 @@ execute(CS, HostState) ->
     execute(#cs.plan, CS, HostState).
 
 -spec execute(integer(), t(), HostState) -> {t(), HostState}.
-execute(Field, CS, HostState) ->
-    execute(Field, fun real_world/2, undefined, fun result_handler/4, CS, HostState).
+execute(Field, CS0, HS0) ->
+    {_, CS, HS} = execute(Field, fun real_world/2, undefined, fun result_handler/4, CS0, HS0),
+    {CS, HS}.
 
 -spec execute(
     integer(), effect_handler(EffHandlerState), EffHandlerState, result_handler(), t(), HostState
