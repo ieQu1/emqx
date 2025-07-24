@@ -14,10 +14,7 @@
 -include("emqx_ds.hrl").
 -include("../src/emqx_ds_client_internals.hrl").
 
--define(ws, world_stage).
-
-%-define(fake_shards, [<<"0">>, <<"12">>]).
--define(fake_shards, [<<>>]).
+-define(fake_shards, [<<"0">>, <<"12">>]).
 
 %%================================================================================
 %% Basic tests
@@ -27,102 +24,6 @@
 -define(watch_ref(SUBID, CTR), {w, SUBID, CTR}).
 -define(sub_handle(SUBID, REF), {h, SUBID, REF}).
 -define(sub_ref(SUBID, HANDLE), {s, SUBID, HANDLE}).
-
-%% This testcase verifies `execute/4' function
-interpreter_test() ->
-    %% Schedule 3 actions. Action is a tuple `{Id, Value}'.
-    GS0 = emqx_ds_client:plan(
-        {3, 2}, emqx_ds_client:plan({2, 2}, emqx_ds_client:plan({1, 1}, #cs{}))
-    ),
-    %% Simple effect handler:
-    EffHandler = fun({_Id, Val}, EffHandlerState) ->
-        {
-            Val - 1,
-            EffHandlerState + 1
-        }
-    end,
-    %% Effect result handler:
-    ResHandler = fun({Id, Val}, GS1, Acc, Result) ->
-        {
-            case Result of
-                0 -> GS1;
-                _ -> emqx_ds_client:plan({Id, Result}, GS1)
-            end,
-            [{Id, Val} | Acc]
-        }
-    end,
-    EffHandlerState0 = 0,
-    {EffHandlerState, GS, History} = emqx_ds_client:execute(
-        #cs.plan, EffHandler, EffHandlerState0, ResHandler, GS0, []
-    ),
-    ?assertMatch(
-        #cs{plan = [], retry = []},
-        GS,
-        "All planned actions should be executed"
-    ),
-    snabbkaffe_diff:assert_lists_eq(
-        [{1, 1}, {2, 2}, {3, 2}, {2, 1}, {3, 1}],
-        lists:reverse(History)
-    ),
-    ?assertEqual(
-        EffHandlerState,
-        length(History),
-        "State of the effect handler should match the number of effects it handled"
-    ).
-
-%% %% This testcase verifies how `retry/2' function adds actions to the
-%% %% plan and starts the retry timer. Then it verifies that dispatch
-%% %% function correctly interprets the timeout message.
-%% retry_test() ->
-%%     %% Effect handler increments the counter in the state and always
-%%     %% returns ok:
-%%     EffHandler = fun(_Eff, EffHandlerState) -> {ok, EffHandlerState + 1} end,
-%%     %% Result handler adds effects to the history:
-%%     ResHandler = fun(Eff, GS, Acc, _Res) -> {GS, [Eff | Acc]} end,
-%%     %% Create the state and add two retry actions:
-%%     GS0 = emqx_ds_client:new(undefined, #{retry_interval => 10}),
-%%     GS1 = emqx_ds_client:retry(2, emqx_ds_client:retry(1, GS0)),
-%%     %% Verify the state:
-%%     ?assertMatch(
-%%         [2, 1],
-%%         GS1#cs.retry,
-%%         "Retry actions have been added"
-%%     ),
-%%     ?assert(
-%%         is_reference(GS1#cs.retry_tref),
-%%         "Retry timer has been started"
-%%     ),
-%%     %% Add more actions:
-%%     GS2 = emqx_ds_client:retry(3, GS1),
-%%     ?assertMatch(
-%%         [3, 2, 1],
-%%         GS2#cs.retry,
-%%         "New retry action have been added"
-%%     ),
-%%     ?assertEqual(
-%%         GS1#cs.retry_tref,
-%%         GS2#cs.retry_tref,
-%%         "Retry timer is the same"
-%%     ),
-%%     %% Receive retry message:
-%%     receive
-%%         Msg ->
-%%             Res1 = emqx_ds_client:do_dispatch_message(Msg, GS2, []),
-%%             ?assertMatch(
-%%                {#cs.
-%%             %% Res1 = emqx_ds_client:do_dispatch_message(EffHandler, 0, ResHandler, GS2, Msg, []),
-%%             ?assertMatch(
-%%                 {3, #cs{retry = [], retry_tref = undefined}, [3, 2, 1]},
-%%                 Res1,
-%%                 #{msg => Msg, state => GS2}
-%%             ),
-%%             %% There are no duplicate or unexpected messages:
-%%             receive
-%%                 Unexpected -> error({unexpected_message, Unexpected})
-%%             after 30 -> ok
-%%             end
-%%     after 30 -> error(no_retry_message)
-%%     end.
 
 filter_effects_test() ->
     IsEven = fun(E) -> (E rem 2) =:= 0 end,
@@ -210,14 +111,15 @@ get_iterator(SubId, _Slab, Stream, #test_host_state{iterators = Its}) ->
 %% Proper test
 %%================================================================================
 
-%%-define(test_sub_ids, [id1, id2]).
--define(test_sub_ids, [id1]).
+-define(test_sub_ids, [id1, id2]).
 
 -define(err_get_streams, err_get_streams).
 -define(err_make_iterator, err_make_iterator).
 -define(err_subscribe, err_subscribe).
 
 -type error_type() :: ?err_get_streams | ?err_make_iterator | ?err_subscribe.
+
+-define(ws, emqx_ds_client_tests_ws).
 
 %% "All the world's a stage", Shakespeare.
 %%
@@ -242,7 +144,7 @@ get_iterator(SubId, _Slab, Stream, #test_host_state{iterators = Its}) ->
     err_rec = #{} :: #{{emqx_ds:shard(), error_type()} => true},
     subs = #{} :: #{emqx_ds_client:sub_id() => {_DB, _Topic, _Opts}},
     exists = false :: boolean(),
-    runtime = {#world_stage{}, undefined, #test_host_state{}}
+    runtime = {undefined, #test_host_state{}}
 }).
 
 current_gen(Shard, #model_state{current_generation = CG}) ->
@@ -359,16 +261,16 @@ command(MS = #model_state{exists = false}) ->
 command(MS = #model_state{err_rec = Errors, subs = Subs}) ->
     frequency(
         [{3, gen_fix_all_errors(MS)} || maps:size(Errors) > 0] ++
-            %% [{3, gen_fix_error(MS)} || maps:size(Errors) > 0] ++
-            %% [{2, gen_ds_sub_recoverable_error(MS)} || maps:size(Subs) > 0] ++
+            [{3, gen_fix_error(MS)} || maps:size(Errors) > 0] ++
+            [{2, gen_ds_sub_recoverable_error(MS)} || maps:size(Subs) > 0] ++
             [{2, gen_ds_sub_payloads(MS)} || maps:size(Subs) > 0] ++
             [
-                %% {3, gen_inject_error(MS)},
-                %% {1, gen_destroy(MS)},
+                {3, gen_inject_error(MS)},
+                {1, gen_destroy(MS)},
                 {3, gen_subscribe(MS)},
-                %% {2, gen_unsubscribe(MS)},
+                {2, gen_unsubscribe(MS)},
                 {5, gen_add_generation(MS)},
-                %% {1, gen_del_generation(MS)},
+                {1, gen_del_generation(MS)},
                 {5, gen_add_stream(MS)}
             ]
     ).
@@ -477,8 +379,6 @@ run_proper() ->
                 ),
                 begin
                     put(?ws, #world_stage{}),
-                    put(?ts, #test_host_state{}),
-                    put(?cs, #cs{}),
                     {_History, _State, Result} = proper_statem:run_commands(?MODULE, Cmds),
                     ?assertMatch(ok, Result),
                     aggregate(command_names(Cmds), true)
@@ -497,10 +397,10 @@ format_cmds(Cmds) ->
         Cmds
     ).
 
-pprint_mstate(MS = #model_state{runtime = {WS, CS, HS}}) ->
+pprint_mstate(MS = #model_state{runtime = {CS, HS}}) ->
     ?record_to_map(model_state, MS#model_state{
         runtime = #{
-            world => ?record_to_map(world_stage, WS),
+            world => ?record_to_map(world_stage, get(?ws)),
             client => emqx_ds_client:pprint_cs(CS),
             host => ?record_to_map(test_host_state, HS)
         }
@@ -577,8 +477,8 @@ subscribe__test() ->
 %% This function verifies 1:1 relation between watches and
 %% subscriptions owned by the client and those that exist in the fake
 %% world. That is, there aren't any dangling or leaked subscriptions.
-prop_ownership(#model_state{runtime = {WS, CS, _}}) ->
-    #world_stage{watches = Watches, ds_subs = Subs} = WS,
+prop_ownership(#model_state{runtime = {CS, _}}) ->
+    WS = #world_stage{watches = Watches, ds_subs = Subs} = get(?ws),
     case CS of
         undefined ->
             %% Client doesn't exist:
@@ -595,19 +495,18 @@ prop_ownership(#model_state{runtime = {WS, CS, _}}) ->
         #cs{new_streams_watches = OwnedWatches, ds_subs = OwnedSubs} ->
             %% Client exists:
             snabbkaffe_diff:assert_lists_eq(
-                lists:sort(Watches),
-                lists:sort(maps:keys(OwnedWatches))
+                lists:sort(maps:keys(OwnedWatches)),
+                lists:sort(Watches)
             ),
             ActiveSubRefs = [SRef || #test_ds_sub{sref = SRef} <- Subs],
-            ?assertMatch(
-                [],
-                ActiveSubRefs -- maps:keys(OwnedSubs),
-                "Leaked DS subscriptions"
-            ),
-            ?assertMatch(
-                [],
-                maps:keys(OwnedSubs) -- ActiveSubRefs,
-                "Dangling DS subscriptions"
+            snabbkaffe_diff:assert_lists_eq(
+                lists:sort(maps:keys(OwnedSubs)),
+                lists:sort(ActiveSubRefs),
+                #{
+                    comment => #{
+                        cs => emqx_ds_client:inspect(CS), ws => ?record_to_map(world_stage, WS)
+                    }
+                }
             )
     end,
     true.
@@ -688,11 +587,11 @@ prop_dispatch_result(Message, Client, Result) ->
         }}
     ).
 
-prop_host_seen_all_streams(#model_state{runtime = {_, undefined, _}}) ->
+prop_host_seen_all_streams(#model_state{runtime = {undefined, _}}) ->
     %% Client doesn't exist, nothing to verify.
     true;
 prop_host_seen_all_streams(#model_state{
-    err_rec = ErrRec, runtime = {_WS, CS, HS}, streams = Streams
+    err_rec = ErrRec, runtime = {CS, HS}, streams = Streams
 }) ->
     case maps:size(ErrRec) of
         0 ->
@@ -766,7 +665,7 @@ prop_host_seen_all_streams(#model_state{
 
 %% When the system is healthy, all streams for the current generation
 %% should be either fully replayed or active.
-prop_no_pending_when_healthy(#model_state{err_rec = Errors, runtime = {_WS, CS, _}}) ->
+prop_no_pending_when_healthy(#model_state{err_rec = Errors, runtime = {CS, _}}) ->
     Healthy = maps:size(Errors) =:= 0,
     case CS of
         #cs{} when Healthy ->
@@ -790,9 +689,9 @@ prop_no_pending_when_healthy(#model_state{err_rec = Errors, runtime = {_WS, CS, 
     end.
 
 %% There is 1:1 correspondence between active streams and DS subscriptions:
-prop_active_subscriptions(#model_state{runtime = {_WS, undefined, _HS}}) ->
+prop_active_subscriptions(#model_state{runtime = {undefined, _HS}}) ->
     ok;
-prop_active_subscriptions(#model_state{runtime = {_WS, CS, _HS}}) ->
+prop_active_subscriptions(#model_state{runtime = {CS, _HS}}) ->
     #cs{ds_subs = DSSubs, streams = Streams} = CS,
     %% Collect all active streams with subscriptions:
     ActiveStreams = maps:fold(
@@ -821,7 +720,7 @@ prop_active_subscriptions(#model_state{runtime = {_WS, CS, _HS}}) ->
 %% Verify that when the system is healthy, after sending the data all
 %% subscriptions registered by the host advance to the last
 %% generations.
-prop_host_generations(MS = #model_state{err_rec = Errors, runtime = {_WS, _, HS}}, Call) ->
+prop_host_generations(MS = #model_state{err_rec = Errors, runtime = {_, HS}}, Call) ->
     %% TODO: this doesn't work like this. The client can advance the
     %% generation, but unless it receives some data or end_of_stream,
     %% it won't reach the last generation.
@@ -856,29 +755,29 @@ prop_host_generations(MS = #model_state{err_rec = Errors, runtime = {_WS, _, HS}
 %% Fake versions of commands
 %%------------------------------------------------------------------------------
 
-fake_new(#model_state{runtime = {WS, _, HS}}) ->
-    GS = emqx_ds_client:new(?MODULE, #{retry_interval => 10000000}),
-    {WS, GS, HS}.
+fake_new(#model_state{runtime = {_, HS}}) ->
+    CS = emqx_ds_client:new(?MODULE, #{retry_interval => 10000000}),
+    {CS, HS}.
 
-fake_destroy(MS = #model_state{runtime = {WS, GS0, HS}}) ->
-    GS = emqx_ds_client:destroy_(GS0),
+fake_destroy(MS = #model_state{runtime = {CS0, HS}}) ->
+    CS = emqx_ds_client:destroy_(CS0),
     setelement(
-        2,
-        execute_planned(MS#model_state{runtime = {WS, GS, HS}}),
+        1,
+        execute_planned(MS#model_state{runtime = {CS, HS}}),
         undefined
     ).
 
-fake_subscribe(MS = #model_state{runtime = {WS, GS0, HS}}, SubId, DB, Topic) ->
-    {ok, GS} = emqx_ds_client:subscribe_(
-        GS0,
+fake_subscribe(MS = #model_state{runtime = {CS0, HS}}, SubId, DB, Topic) ->
+    {ok, CS} = emqx_ds_client:subscribe_(
+        CS0,
         #{id => SubId, db => DB, topic => Topic},
         HS
     ),
-    execute_planned(MS#model_state{runtime = {WS, GS, HS}}).
+    execute_planned(MS#model_state{runtime = {CS, HS}}).
 
-fake_unsubscribe(MS = #model_state{runtime = {WS, GS0, HS0}}, SubId) ->
-    {ok, GS, HS} = emqx_ds_client:unsubscribe_(GS0, SubId, HS0),
-    execute_planned(MS#model_state{runtime = {WS, GS, HS}}).
+fake_unsubscribe(MS = #model_state{runtime = {CS0, HS0}}, SubId) ->
+    {ok, GS, HS} = emqx_ds_client:unsubscribe_(CS0, SubId, HS0),
+    execute_planned(MS#model_state{runtime = {GS, HS}}).
 
 add_generation(#model_state{runtime = RS}, _Shard, _Generation) ->
     RS.
@@ -886,7 +785,7 @@ add_generation(#model_state{runtime = RS}, _Shard, _Generation) ->
 %% Dispatch 'DOWN' messages for all subscriptions to streams that no
 %% longer exist:
 del_generation(
-    MS0 = #model_state{streams = Streams, runtime = RS0 = {WS, _, _}}, _Shard, _Generation, Graceful
+    MS0 = #model_state{streams = Streams, runtime = RS0 = {_, _}}, _Shard, _Generation, Graceful
 ) ->
     EffHandler = fake_world(MS0),
     Reason =
@@ -904,12 +803,12 @@ del_generation(
             end
         end,
         RS0,
-        WS#world_stage.ds_subs
+        (get(?ws))#world_stage.ds_subs
     ).
 
-ds_sub_recoverable_error(MS = #model_state{runtime = RS0 = {WS, _, _}}, Reason) ->
+ds_sub_recoverable_error(MS = #model_state{runtime = RS0 = {_, _}}, Reason) ->
     %% Emulate all DS subscriptions going down:
-    #world_stage{ds_subs = DSSubs} = WS,
+    #world_stage{ds_subs = DSSubs} = get(?ws),
     EffHandler = fake_world(MS),
     lists:foldl(
         fun(#test_ds_sub{sref = SRef}, RS) ->
@@ -919,8 +818,10 @@ ds_sub_recoverable_error(MS = #model_state{runtime = RS0 = {WS, _, _}}, Reason) 
         DSSubs
     ).
 
-destroy_ds_sub(EffHandler, SRef, {WS0 = #world_stage{ds_subs = DSSubs0}, CS, HS}, Reason) ->
+destroy_ds_sub(EffHandler, SRef, {CS, HS}, Reason) ->
+    WS0 = #world_stage{ds_subs = DSSubs0} = get(?ws),
     WS = WS0#world_stage{ds_subs = lists:keydelete(SRef, #test_ds_sub.sref, DSSubs0)},
+    put(?ws, WS),
     Msg =
         case Reason of
             'DOWN' ->
@@ -937,10 +838,10 @@ destroy_ds_sub(EffHandler, SRef, {WS0 = #world_stage{ds_subs = DSSubs0}, CS, HS}
                     seqno = -1
                 }
         end,
-    dispatch_message(Msg, EffHandler, {WS, CS, HS}).
+    dispatch_message(Msg, EffHandler, {CS, HS}).
 
-add_stream(MS = #model_state{runtime = RS = {WS, _CS, _HS}}, _Stream) ->
-    #world_stage{watches = Watches} = WS,
+add_stream(MS = #model_state{runtime = RS = {_CS, _HS}}, _Stream) ->
+    #world_stage{watches = Watches} = get(?ws),
     Events = [#new_stream_event{subref = W} || W <- Watches],
     EffHandler = fake_world(MS),
     lists:foldl(
@@ -951,10 +852,10 @@ add_stream(MS = #model_state{runtime = RS = {WS, _CS, _HS}}, _Stream) ->
         Events
     ).
 
-ds_publish_payloads(MS = #model_state{runtime = RS0 = {WS0, _, _}}, BatchSize, SeqNoError) ->
-    #world_stage{ds_subs = DSSubs0} = WS0,
+ds_publish_payloads(MS = #model_state{runtime = RS0 = {_, _}}, BatchSize, SeqNoError) ->
+    #world_stage{ds_subs = DSSubs0} = get(?ws),
     EffHandler = fake_world(MS),
-    {DSSubs, {WS1, CS, HS}} = lists:mapfoldl(
+    lists:foldl(
         fun(DSSub = #test_ds_sub{sref = SRef, it = It0, seqno = SeqNo0}, RS1) ->
             #fake_iter{stream = #fake_stream{shard = Shard, gen = Gen}} = It0,
             Msg =
@@ -980,13 +881,23 @@ ds_publish_payloads(MS = #model_state{runtime = RS0 = {WS0, _, _}}, BatchSize, S
                         }
                 end,
             ?tp(test_publish_message_to_sub, #{message => Msg}),
-            {DSSub#test_ds_sub{seqno = SeqNo}, dispatch_message(Msg, EffHandler, RS1)}
+            update_seqno(DSSub, SeqNo),
+            dispatch_message(Msg, EffHandler, RS1)
         end,
         RS0,
         DSSubs0
-    ),
-    WS = WS1#world_stage{ds_subs = DSSubs},
-    {WS, CS, HS}.
+    ).
+
+update_seqno(DSSub = #test_ds_sub{sref = SRef}, SeqNo) ->
+    with_world(
+        fun(WS = #world_stage{ds_subs = Subs}) ->
+            {ok, WS#world_stage{
+                ds_subs = lists:keyreplace(SRef, #test_ds_sub.sref, Subs, DSSub#test_ds_sub{
+                    seqno = SeqNo
+                })
+            }}
+        end
+    ).
 
 fix_all_errors(#model_state{runtime = RS}) ->
     RS.
@@ -1011,9 +922,7 @@ wrapper(MS0, Fun, Args) ->
     %% Apply the function to the state and also verify the return
     %% value of the operation, it should be a valid runtime state
     %% triple:
-    RS =
-        {#world_stage{}, CS, #test_host_state{}} =
-        apply(?MODULE, Fun, [MS | Args]),
+    RS = {CS, #test_host_state{}} = apply(?MODULE, Fun, [MS | Args]),
     %% Emulate firing of the retry timer if the client exists:
     case CS of
         undefined ->
@@ -1027,37 +936,37 @@ wrapper(MS0, Fun, Args) ->
             )
     end.
 
-dispatch_message(Message, EffectHandler, {WS, CS0, HS0}) ->
+dispatch_message(Message, EffectHandler, {CS0, HS0}) ->
     Result = emqx_ds_client:do_dispatch_message(Message, CS0, HS0),
     prop_dispatch_result(Message, CS0, Result),
     case Result of
         ignore ->
-            {WS, CS0, HS0};
+            {CS0, HS0};
         {data, SubId, Stream, Reply} ->
             case Reply of
                 #ds_sub_reply{ref = Ref, payload = {ok, end_of_stream}} ->
                     HS1 = host_set_iter(SubId, Stream, end_of_stream, HS0),
                     {CS, HS} = emqx_ds_client:complete_stream_(CS0, Ref, HS1),
-                    execute(EffectHandler, #cs.plan, WS, CS, HS);
+                    execute(EffectHandler, #cs.plan, CS, HS);
                 #ds_sub_reply{} ->
-                    {WS, CS0, HS0}
+                    {CS0, HS0}
             end;
         {Field, CS, HS} ->
-            execute(EffectHandler, Field, WS, CS, HS)
+            execute(EffectHandler, Field, CS, HS)
     end.
 
-execute_planned(MS = #model_state{runtime = {WS, CS, HS}}) ->
-    execute(fake_world(MS), #cs.plan, WS, CS, HS).
+execute_planned(MS = #model_state{runtime = {CS, HS}}) ->
+    execute(fake_world(MS), #cs.plan, CS, HS).
 
-execute(EffectHandler, Field, WS, CS, HS) ->
-    emqx_ds_client:execute(
+execute(EffectHandler, Field, CS0, HS0) ->
+    {CS, HS} = emqx_ds_client:execute(
         Field,
         EffectHandler,
-        WS,
         fun emqx_ds_client:result_handler/4,
-        CS,
-        HS
-    ).
+        CS0,
+        HS0
+    ),
+    {CS, HS}.
 
 %%------------------------------------------------------------------------------
 %% Effect handler
@@ -1072,81 +981,100 @@ fake_world(#model_state{
         not maps:is_key({Shard, ErrorType}, Errors)
     end,
     fun
-        (#eff_watch_streams{sub_id = SubId}, Stage) ->
-            #world_stage{watch_ref_ctr = Ctr, watches = Watches} = Stage,
-            Watch = ?watch_ref(Ctr, SubId),
-            {
-                Watch,
-                Stage#world_stage{watch_ref_ctr = Ctr + 1, watches = [Watch | Watches]}
-            };
-        (#eff_unwatch_streams{watch = Watch}, Stage) ->
-            #world_stage{watches = Watches} = Stage,
-            {
-                ok,
-                Stage#world_stage{watches = Watches -- [Watch]}
-            };
-        (#eff_renew_streams{shard = Shard, current_generation = Gen}, Stage) ->
-            Result =
-                case Err(Shard, ?err_get_streams) of
+        (#eff_watch_streams{sub_id = SubId}) ->
+            with_world(fun(Stage) ->
+                #world_stage{watch_ref_ctr = Ctr, watches = Watches} = Stage,
+                Watch = ?watch_ref(Ctr, SubId),
+                {
+                    Watch,
+                    Stage#world_stage{watch_ref_ctr = Ctr + 1, watches = [Watch | Watches]}
+                }
+            end);
+        (#eff_unwatch_streams{watch = Watch}) ->
+            with_world(fun(Stage) ->
+                #world_stage{watches = Watches} = Stage,
+                {
+                    ok,
+                    Stage#world_stage{watches = Watches -- [Watch]}
+                }
+            end);
+        (#eff_renew_streams{shard = Shard, current_generation = Gen}) ->
+            with_world(fun(Stage) ->
+                Result =
+                    case Err(Shard, ?err_get_streams) of
+                        true ->
+                            Filtered = [
+                                {{S, G}, Stream}
+                             || Stream = #fake_stream{shard = S, gen = G} <- Streams,
+                                S =:= Shard,
+                                G >= Gen
+                            ],
+                            {Filtered, []};
+                        false ->
+                            {[], [?err_rec(simulated)]}
+                    end,
+                {Result, Stage}
+            end);
+        (#eff_make_iterator{stream = Stream, start_time = Time}) ->
+            with_world(fun(Stage) ->
+                #fake_stream{shard = Shard} = Stream,
+                Result =
+                    case Err(Shard, ?err_make_iterator) of
+                        true ->
+                            case lists:member(Stream, Streams) of
+                                true ->
+                                    {ok, #fake_iter{stream = Stream, time = Time}};
+                                false ->
+                                    ?err_unrec(no_such_stream)
+                            end;
+                        false ->
+                            ?err_rec(simulated)
+                    end,
+                {Result, Stage}
+            end);
+        (#eff_ds_sub{sub_id = SubId, iterator = It}) ->
+            with_world(fun(Stage) ->
+                #fake_iter{stream = #fake_stream{shard = Shard}} = It,
+                #world_stage{sub_ref_ctr = Ctr, ds_subs = DSSubs} = Stage,
+                case Err(Shard, ?err_subscribe) of
                     true ->
-                        Filtered = [
-                            {{S, G}, Stream}
-                         || Stream = #fake_stream{shard = S, gen = G} <- Streams,
-                            S =:= Shard,
-                            G >= Gen
-                        ],
-                        {Filtered, []};
+                        Handle = ?sub_handle(SubId, Ctr),
+                        SubRef = ?sub_ref(SubId, Handle),
+                        DSSub = #test_ds_sub{
+                            sref = SubRef,
+                            handle = Handle,
+                            it = It
+                        },
+                        {
+                            {ok, Handle, SubRef},
+                            Stage#world_stage{
+                                sub_ref_ctr = Ctr + 1,
+                                ds_subs = [DSSub | DSSubs]
+                            }
+                        };
                     false ->
-                        {[], [?err_rec(simulated)]}
-                end,
-            {Result, Stage};
-        (#eff_make_iterator{stream = Stream, start_time = Time}, Stage) ->
-            #fake_stream{shard = Shard} = Stream,
-            Result =
-                case Err(Shard, ?err_make_iterator) of
-                    true ->
-                        case lists:member(Stream, Streams) of
-                            true ->
-                                {ok, #fake_iter{stream = Stream, time = Time}};
-                            false ->
-                                ?err_unrec(no_such_stream)
-                        end;
-                    false ->
-                        ?err_rec(simulated)
-                end,
-            {Result, Stage};
-        (#eff_ds_sub{sub_id = SubId, iterator = It}, Stage) ->
-            #fake_iter{stream = #fake_stream{shard = Shard}} = It,
-            #world_stage{sub_ref_ctr = Ctr, ds_subs = DSSubs} = Stage,
-            case Err(Shard, ?err_subscribe) of
-                true ->
-                    Handle = ?sub_handle(SubId, Ctr),
-                    SubRef = ?sub_ref(SubId, Handle),
-                    DSSub = #test_ds_sub{
-                        sref = SubRef,
-                        handle = Handle,
-                        it = It
-                    },
-                    {
-                        {ok, Handle, SubRef},
-                        Stage#world_stage{
-                            sub_ref_ctr = Ctr + 1,
-                            ds_subs = [DSSub | DSSubs]
+                        {
+                            ?err_rec(simulated),
+                            Stage
                         }
-                    };
-                false ->
-                    {
-                        ?err_rec(simulated),
-                        Stage
-                    }
-            end;
-        (#eff_ds_unsub{handle = Handle}, Stage) ->
-            %% Theoretically, it can fail too, but usually it means
-            %% the subscription will expire via monitor:
-            #world_stage{ds_subs = DSSubs0} = Stage,
-            DSSubs = lists:keydelete(Handle, #test_ds_sub.handle, DSSubs0),
-            {
-                ok,
-                Stage#world_stage{ds_subs = DSSubs}
-            }
+                end
+            end);
+        (#eff_ds_unsub{handle = Handle}) ->
+            with_world(fun(Stage) ->
+                %% Theoretically, it can fail too, but usually it means
+                %% the subscription will expire via monitor:
+                #world_stage{ds_subs = DSSubs0} = Stage,
+                DSSubs = lists:keydelete(Handle, #test_ds_sub.handle, DSSubs0),
+                {
+                    ok,
+                    Stage#world_stage{ds_subs = DSSubs}
+                }
+            end)
     end.
+
+%% FIXME: remove
+with_world(Fun) ->
+    {Result, WS} =
+        Fun(get(?ws)),
+    put(?ws, WS),
+    Result.

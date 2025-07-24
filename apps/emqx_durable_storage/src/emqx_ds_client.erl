@@ -79,9 +79,7 @@ Global state of the client. It encapsulates states of all active subscriptions.
 """.
 -opaque t() :: #cs{}.
 
--type effect_handler(EffectHandlerState) :: fun(
-    (effect(), EffectHandlerState) -> {_Result, EffectHandlerState}
-).
+-type effect_handler() :: fun((effect()) -> _Result).
 -type result_handler() :: fun((effect(), t(), Acc, _Result) -> {t(), Acc}).
 
 %%================================================================================
@@ -250,7 +248,8 @@ inspect(CS = #cs{streams = Streams, ds_subs = DSSubs}) ->
 complete_stream_(CS0 = #cs{ds_subs = DSSubs}, SRef, HS) ->
     case DSSubs of
         #{SRef := DSSub} ->
-            #ds_sub{id = SubId, db = DB, handle = Handle, slab = {Shard, _}, stream = Stream} = DSSub,
+            #ds_sub{id = SubId, db = DB, handle = Handle, slab = {Shard, _}, stream = Stream} =
+                DSSub,
             with_stream_cache(
                 SubId,
                 Shard,
@@ -264,7 +263,7 @@ complete_stream_(CS0 = #cs{ds_subs = DSSubs}, SRef, HS) ->
                         replayed = Replayed#{Stream => true},
                         active = maps:remove(Stream, Active)
                     },
-
+                    maybe_advance_generation(SubId, Shard, Cache, CS1, HS)
                 end
             );
         #{} ->
@@ -642,13 +641,12 @@ handle_make_iterator_fail(Eff, CS = #cs{cbm = CBM}, HostState, Err) ->
         on_unrecoverable_error(CBM, SubId, Slab, Stream, Err, HostState)
     }.
 
--spec real_world(effect(), undefined) -> {_Result, undefined}.
-real_world(#eff_watch_streams{db = DB, topic = Topic}, State) ->
+-spec real_world(effect()) -> _Result.
+real_world(#eff_watch_streams{db = DB, topic = Topic}) ->
     {ok, Watch} = emqx_ds_new_streams:watch(DB, Topic),
-    {Watch, State};
-real_world(#eff_unwatch_streams{db = DB, watch = Watch}, State) ->
-    Result = emqx_ds_new_streams:unwatch(DB, Watch),
-    {Result, State};
+    Watch;
+real_world(#eff_unwatch_streams{db = DB, watch = Watch}) ->
+    emqx_ds_new_streams:unwatch(DB, Watch);
 real_world(
     #eff_renew_streams{
         db = DB,
@@ -656,14 +654,11 @@ real_world(
         topic = Topic,
         start_time = StartTime,
         current_generation = Gen
-    },
-    State
+    }
 ) ->
-    Result = emqx_ds:get_streams(DB, Topic, StartTime, #{shard => Shard, generation_min => Gen}),
-    {Result, State};
-real_world(#eff_make_iterator{db = DB, stream = Stream, topic = TF, start_time = StartTime}, State) ->
-    Result = emqx_ds:make_iterator(DB, Stream, TF, StartTime),
-    {Result, State}.
+    emqx_ds:get_streams(DB, Topic, StartTime, #{shard => Shard, generation_min => Gen});
+real_world(#eff_make_iterator{db = DB, stream = Stream, topic = TF, start_time = StartTime}) ->
+    emqx_ds:make_iterator(DB, Stream, TF, StartTime).
 
 %%------------------------------------------------------------------------------
 %% Stream management
@@ -1032,13 +1027,11 @@ execute(CS, HostState) ->
 
 -spec execute(integer(), t(), HostState) -> {t(), HostState}.
 execute(Field, CS0, HS0) ->
-    {_, CS, HS} = execute(Field, fun real_world/2, undefined, fun result_handler/4, CS0, HS0),
+    {_, CS, HS} = execute(Field, fun real_world/1, fun result_handler/4, CS0, HS0),
     {CS, HS}.
 
--spec execute(
-    integer(), effect_handler(EffHandlerState), EffHandlerState, result_handler(), t(), HostState
-) -> {EffHandlerState, t(), HostState}.
-execute(Field, EffectHandler, EffHandlerState0, ResultHandler, CS0, HS0) ->
+-spec execute(integer(), effect_handler(), result_handler(), t(), HostState) -> {t(), HostState}.
+execute(Field, EffectHandler, ResultHandler, CS0, HS0) ->
     ?tp_ignore_side_effects_in_prod(emqx_ds_client_exec_loop, #{field => Field}),
     case element(Field, CS0) of
         [] ->
@@ -1046,30 +1039,29 @@ execute(Field, EffectHandler, EffHandlerState0, ResultHandler, CS0, HS0) ->
             ?tp_ignore_side_effects_in_prod(emqx_ds_client_exec_done, #{
                 cs => inspect(CS0), hs => HS0
             }),
-            {EffHandlerState0, CS0, HS0};
+            {CS0, HS0};
         Effects ->
             %% Clear effects in the state:
             CS1 = erlang:setelement(Field, CS0, []),
-            {EffHandlerState, CS, HS} = do_execute(
-                EffectHandler, EffHandlerState0, ResultHandler, lists:reverse(Effects), CS1, HS0
+            {CS, HS} = do_execute(
+                EffectHandler, ResultHandler, lists:reverse(Effects), CS1, HS0
             ),
             %% Note: from this point on we always continue on the
             %% `#cs.plan', even if the original `Field' was
             %% `#cs.retry'. Effects can fail again, we should retry
             %% them later:
-            execute(#cs.plan, EffectHandler, EffHandlerState, ResultHandler, CS, HS)
+            execute(#cs.plan, EffectHandler, ResultHandler, CS, HS)
     end.
 
--spec do_execute(
-    effect_handler(EffHandlerState), EffHandlerState, result_handler(), [effect()], t(), HostState
-) -> {EffHandlerState, t(), HostState}.
-do_execute(_, EffHandlerState, _, [], CS, Acc) ->
-    {EffHandlerState, CS, Acc};
-do_execute(EffectHandler, EffHandlerState0, ResultHandler, [Effect | Effects], CS0, Acc0) ->
-    {Result, EffHandlerState} = EffectHandler(Effect, EffHandlerState0),
+-spec do_execute(effect_handler(), result_handler(), [effect()], t(), HostState) ->
+    {t(), HostState}.
+do_execute(_, _, [], CS, Acc) ->
+    {CS, Acc};
+do_execute(EffectHandler, ResultHandler, [Effect | Effects], CS0, Acc0) ->
+    Result = EffectHandler(Effect),
     ?tp_ignore_side_effects_in_prod(emqx_ds_client_exec, #{eff => Effect, res => Result}),
     {CS, Acc} = ResultHandler(Effect, CS0, Acc0, Result),
-    do_execute(EffectHandler, EffHandlerState, ResultHandler, Effects, CS, Acc).
+    do_execute(EffectHandler, ResultHandler, Effects, CS, Acc).
 
 %%------------------------------------------------------------------------------
 %% Callback module wrappers:
