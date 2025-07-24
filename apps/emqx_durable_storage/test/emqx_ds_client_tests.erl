@@ -46,6 +46,7 @@ filter_effects_test() ->
         {emqx_ds_client:sub_id(), emqx_ds:stream()} => emqx_ds:iteraator() | end_of_stream
     }
 }).
+-define(hs, emqx_ds_client_tests_hs).
 
 -record(fake_stream, {shard, gen, id}).
 -record(fake_iter, {stream, time}).
@@ -84,7 +85,7 @@ on_new_iterator(
     {subscribe, host_set_iter(SubId, Stream, It, HS)}.
 
 host_get_iter(SubId, Stream, #test_host_state{iterators = Its}) ->
-    map:get({SubId, Stream}, Its, undefined).
+    maps:get({SubId, Stream}, Its, undefined).
 
 host_set_iter(SubId, Stream, It, HS = #test_host_state{iterators = Its}) ->
     HS#test_host_state{
@@ -379,6 +380,7 @@ run_proper() ->
                 ),
                 begin
                     put(?ws, #world_stage{}),
+                    put(?hs, #test_host_state{}),
                     {_History, _State, Result} = proper_statem:run_commands(?MODULE, Cmds),
                     ?assertMatch(ok, Result),
                     aggregate(command_names(Cmds), true)
@@ -991,11 +993,10 @@ fake_world(#model_state{
                 }
             end);
         (#eff_unwatch_streams{watch = Watch}) ->
-            with_world(fun(Stage) ->
-                #world_stage{watches = Watches} = Stage,
+            with_world(#world_stage.watches, fun(Watches) ->
                 {
                     ok,
-                    Stage#world_stage{watches = Watches -- [Watch]}
+                    Watches -- [Watch]
                 }
             end);
         (#eff_renew_streams{shard = Shard, current_generation = Gen}) ->
@@ -1060,21 +1061,33 @@ fake_world(#model_state{
                 end
             end);
         (#eff_ds_unsub{handle = Handle}) ->
-            with_world(fun(Stage) ->
+            with_world(#world_stage.ds_subs, fun(DSSubs0) ->
                 %% Theoretically, it can fail too, but usually it means
                 %% the subscription will expire via monitor:
-                #world_stage{ds_subs = DSSubs0} = Stage,
                 DSSubs = lists:keydelete(Handle, #test_ds_sub.handle, DSSubs0),
                 {
                     ok,
-                    Stage#world_stage{ds_subs = DSSubs}
+                    DSSubs
                 }
             end)
     end.
 
-%% FIXME: remove
 with_world(Fun) ->
     {Result, WS} =
         Fun(get(?ws)),
     put(?ws, WS),
+    Result.
+
+with_world(Field, Fun) ->
+    with_world(
+        fun(World) ->
+            {Ret, NewVal} = Fun(element(Field, World)),
+            {Ret, setelement(Field, World, NewVal)}
+        end
+    ).
+
+with_host(Fun) ->
+    {Result, HS} =
+        Fun(get(?hs)),
+    put(?hs, HS),
     Result.
