@@ -166,7 +166,7 @@ Destroy the client and all its subscriptions.
 """.
 -spec destroy(t(), HostState) -> HostState.
 destroy(CS, HostState0) ->
-    {_, _, HostState} = execute(destroy_(CS), HostState0),
+    {_, HostState} = execute(destroy_(CS), HostState0),
     HostState.
 
 -doc """
@@ -213,14 +213,14 @@ Generally, all messages received by the process should be passed into this funct
 
 If atom `ignore` is returned, the message was not addressed to the client and should be processed elsewhere.
 """.
--spec dispatch_message(t(), term(), HostState) ->
+-spec dispatch_message(term(), t(), HostState) ->
     ignore | {t(), HostState} | {data, sub_id(), emqx_ds:stream(), #ds_sub_reply{}}.
-dispatch_message(CS0, Message, HS0) ->
+dispatch_message(Message, CS0, HS0) ->
     case do_dispatch_message(Message, CS0, HS0) of
         ignore ->
             ignore;
-        {data, SubId, Reply} ->
-            {data, SubId, Reply};
+        {data, SubId, Stream, Reply} ->
+            {data, SubId, Stream, Reply};
         {Field, CS, HS} ->
             execute(Field, CS, HS)
     end.
@@ -641,13 +641,13 @@ handle_make_iterator_fail(Eff, CS = #cs{cbm = CBM}, HostState, Err) ->
         on_unrecoverable_error(CBM, SubId, Slab, Stream, Err, HostState)
     }.
 
--spec real_world(effect()) -> _Result.
-real_world(#eff_watch_streams{db = DB, topic = Topic}) ->
+-spec effect_handler(effect()) -> _Result.
+effect_handler(#eff_watch_streams{db = DB, topic = Topic}) ->
     {ok, Watch} = emqx_ds_new_streams:watch(DB, Topic),
     Watch;
-real_world(#eff_unwatch_streams{db = DB, watch = Watch}) ->
+effect_handler(#eff_unwatch_streams{db = DB, watch = Watch}) ->
     emqx_ds_new_streams:unwatch(DB, Watch);
-real_world(
+effect_handler(
     #eff_renew_streams{
         db = DB,
         shard = Shard,
@@ -657,8 +657,12 @@ real_world(
     }
 ) ->
     emqx_ds:get_streams(DB, Topic, StartTime, #{shard => Shard, generation_min => Gen});
-real_world(#eff_make_iterator{db = DB, stream = Stream, topic = TF, start_time = StartTime}) ->
-    emqx_ds:make_iterator(DB, Stream, TF, StartTime).
+effect_handler(#eff_make_iterator{db = DB, stream = Stream, topic = TF, start_time = StartTime}) ->
+    emqx_ds:make_iterator(DB, Stream, TF, StartTime);
+effect_handler(#eff_ds_sub{db = DB, iterator = It, sub_options = Opts}) ->
+    emqx_ds:subscribe(DB, It, Opts);
+effect_handler(#eff_ds_unsub{db = DB, handle = Handle}) ->
+    emqx_ds:unsubscribe(DB, Handle).
 
 %%------------------------------------------------------------------------------
 %% Stream management
@@ -1027,8 +1031,7 @@ execute(CS, HostState) ->
 
 -spec execute(integer(), t(), HostState) -> {t(), HostState}.
 execute(Field, CS0, HS0) ->
-    {_, CS, HS} = execute(Field, fun real_world/1, fun result_handler/4, CS0, HS0),
-    {CS, HS}.
+    execute(Field, fun effect_handler/1, fun result_handler/4, CS0, HS0).
 
 -spec execute(integer(), effect_handler(), result_handler(), t(), HostState) -> {t(), HostState}.
 execute(Field, EffectHandler, ResultHandler, CS0, HS0) ->
