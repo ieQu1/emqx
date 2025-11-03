@@ -22,7 +22,7 @@ Scenarios implemented with this generator have two general variables: =N= and =N
 -behavior(supervisor).
 
 %% API:
--export([l/0, create_db/1, test_dbs/0, create_dbs/0, counter_test/1, owned_counter_test/1]).
+-export([l/0, create_db/1, test_dbs/0, create_dbs/0, counter_test/1, owned_counter_test/1, append_test/1]).
 
 %% Test setup and supervisor callbacks:
 -export([init/1, start_worker/6, worker_entrypoint/5]).
@@ -68,7 +68,7 @@ create_db(UserOpts = #{db := DB, type := ds}) ->
         n_sites => 5,
         replication_factor => 5,
         storage => {emqx_ds_storage_skipstream_lts_v2, #{}},
-        transaction => #{flush_interval => 10, idle_flush_interval => 1, conflict_window => 10_000},
+        transaction => #{flush_interval => 1, idle_flush_interval => 0, conflict_window => 10_000},
         reads => local_preferred
     },
     Opts = emqx_utils_maps:deep_merge(Defaults, maps:remove(db, UserOpts)),
@@ -97,6 +97,7 @@ test_dbs() ->
   %% , #{type => ds, db => d3L, replication_factor => 3, reads => leader_preferred}
   , #{type => ds, db => d5l, replication_factor => 5, reads => local_preferred}
   , #{type => ds, db => d5L, replication_factor => 5, reads => leader_preferred}
+  , #{type => ds, db => dl, backend => builtin_local}
   ].
 
 create_dbs() ->
@@ -131,12 +132,15 @@ def mgroups(df):
     # Group data by measurement type:
     return df.groupby(mtypes, sort=False)
 
-# Style of hisogram where plots are overlayed
+def my_bins(df, q=0.99, n=30):
+    return np.linspace(df['Val'].min(), round(df['Val'].quantile(q=q)), n)
+
+# Style of histogram where plots are overlayed
 def histogram_vs_overlayed(df, title):
     """Calculate a histogram for each measurement type, then plot them all overlayed"""
     plt.figure(dpi=200)
     plt.title(title)
-    bins = np.linspace(df['Val'].min(), df['Val'].max(), 100)
+    bins = my_bins(df)
     plt.xlabel('Transaction Time, μS')
     plt.ylabel('Frequency')
     grps = mgroups(df),
@@ -157,10 +161,11 @@ def histogram_vs_separate(df, title):
     mtypes = df.columns.to_list()
     mtypes.pop()
     # Use the same bins for everything:
-    bins = np.linspace(df['Val'].min(), df['Val'].max(), 100)
+    bins = my_bins(df)
     # Plot it
-    df.hist(column='Val', grid=True, by=mtypes, sharex=True, sharey=True, bins=bins, histtype='stepfilled')
-    plt.tight_layout()
+    plt.autoscale(enable=True)
+    df.hist(column='Val', grid=True, by=mtypes, sharex=True, sharey=True, bins=bins, histtype='step', density=True)
+    # plt.tight_layout()
     fn = title + ".hist.png"
     plt.savefig(fn)
     return fn
@@ -170,10 +175,10 @@ def histogram_vs(df, title):
     #return histogram_vs_overlayed(df, title)
     return histogram_vs_separate(df, title)
 
-def boxplot_vs(df, title):
+def boxplot_vs(df, title,by='DB'):
     plt.close()
     fn = title + ".bp.png"
-    df.boxplot(column='Val', by='DB', flierprops=dict(marker='.', markersize=2), whis=(0, 100))
+    df.boxplot(column='Val', by=by, flierprops=dict(marker='.', markersize=2), whis=(0, 99), showfliers=False)
     plt.savefig(fn)
     return fn
 #+end_src
@@ -211,11 +216,24 @@ Copy CSVs from docker and parse it:
 import pandas as pd
 import os
 
+os.system("docker cp dev-cluster-emqx1-1:/opt/emqx/data/append.csv .")
+df_append = pd.read_csv('append.csv', sep=';')
+
 os.system("docker cp dev-cluster-emqx1-1:/opt/emqx/data/counter.csv .")
 df_cntr = pd.read_csv('counter.csv', sep=';')
 
 os.system("docker cp dev-cluster-emqx1-1:/opt/emqx/data/owned_counter.csv .")
 df_ocntr = pd.read_csv('owned_counter.csv', sep=';')
+#+end_src
+
+
+Read local CSVs:
+
+#+begin_src python :results discard
+import pandas as pd
+import os
+
+df_append = pd.read_csv('../../../_build/emqx-enterprise/rel/emqx/data/append.csv', sep=';')
 #+end_src
 
 #+RESULTS:
@@ -613,6 +631,136 @@ histogram_vs(owc10ko, "10k owned counters, no conflicts, own")
 #+RESULTS:
 [[file:10k owned counters, no conflicts, own.hist.png]]
 
+** Append test
+
+#+begin_src erlang
+append_loop(MyId, Opts = #{db := DB, batch_size := BS, payload := Payload}, undefined) ->
+  Shard = emqx_ds:shard_of(DB, MyId),
+  Topic = [<<"t">>, integer_to_binary(MyId)],
+  Batch = [{Topic, ?ds_tx_ts_monotonic, Payload} || _ <- lists:seq(1, BS)],
+  State = {Shard, Batch},
+  append_loop(MyId, Opts, State);
+append_loop(MyId, Opts = #{db := DB}, {Shard, Batch} = State) ->
+  ?with_metric(t,
+               begin
+                 Ref = emqx_ds:dirty_append(#{db => DB, shard => Shard, reply => true}, Batch),
+                 receive
+                   ?ds_tx_commit_reply(Ref, Reply) ->
+                     case emqx_ds:dirty_append_outcome(Ref, Reply) of
+                       {ok, _} ->
+                         ok;
+                       Err ->
+                         error(#{reason => Err, shard => Shard, worker => MyId})
+                     end
+                 end
+               end),
+  State.
+
+append_test(UserOpts = #{db := DB, payload_size := PSize}) ->
+  Defaults = #{ batch_size => 100
+              , n => 1
+              , n_nodes => 1
+              , repeats => 100
+              },
+  #{ batch_size := NItems
+   , n_nodes := NNodes
+   , n := N
+   } = Opts = maps:merge(Defaults, UserOpts),
+  io:format("Cleanup (payload_size=~p)...~n", [PSize]),
+  clear_table(Opts),
+  timer:sleep(1000),
+  Payload = list_to_binary([0 || _ <- lists:seq(1, PSize)]),
+  Success = exec_test(Opts#{payload => Payload},
+                      fun append_loop/3,
+                      "append",
+                      ["DB", "N", "NNodes", "PayloadSize", "BatchSize"],
+                      [DB, N, NNodes, PSize, NItems]
+                     ),
+  case Success of
+    true ->
+      true;
+    false ->
+      io:format("Run wasn't successful...~n"),
+      false
+  end;
+append_test(UserOpts = #{db := _}) ->
+  MinSize = maps:get(payload_size_min, UserOpts, 0),
+  MaxSize = maps:get(payload_size_max, UserOpts, 10_000),
+  Step = maps:get(payload_size_step, UserOpts, 1000),
+  [append_test(UserOpts#{payload_size => PS}) || PS <- lists:seq(MinSize, MaxSize, Step)];
+append_test(UserOpts) ->
+  [?FUNCTION_NAME(maps:merge(UserOpts, maps:with([db, type], I))) || I <- test_dbs()].
+#+end_src
+
+*** 1000 workers
+#+begin_src elisp :exports none
+(my-run-in-docker "emqx_ds_otx_test:l(), emqx_ds_otx_test:append_test(#{n => 1000, repeats => 10, test_timeout => 300_000}), all_done.")
+#+end_src
+
+#+RESULTS:
+: #<window 126 on *Async Shell Command*>
+
+#+begin_src python :results file :exports result
+a1kdl = df_append[((df_append['N'] == 1000) & (df_append['DB'] == 'dl'))]
+histogram_vs(a1kdl, "1000 append workers, builtin_local, cutoff, 1ms flush")
+#+end_src
+
+#+RESULTS:
+[[file:1000 append workers, builtin_local, cutoff, 1ms flush.hist.png]]
+
+#+begin_src python :results file :exports result
+boxplot_vs(a1kdl,"1000 append workers, 1ms flush",by='PayloadSize')
+#+end_src
+
+
+#+RESULTS:
+[[file:1000 append workers, 1ms flush.bp.png]]
+
+*** 1000 workers, raft w/ 1 replica
+#+begin_src elisp :exports none
+(my-run-in-docker "emqx_ds_otx_test:l(), emqx_ds_otx_test:append_test(#{n => 1000, repeats => 10, test_timeout => 300_000, db => dr}), all_done.")
+#+end_src
+
+#+RESULTS:
+: #<window 115 on *Async Shell Command*>
+
+#+begin_src python :results file :exports result
+a1kdr1 = df_append[((df_append['N'] == 1000) & (df_append['DB'] == 'dr'))]
+histogram_vs(a1kdr1, "1000 append workers, builtin_local, cutoff, raft, 1ms flush")
+#+end_src
+
+#+RESULTS:
+[[file:1000 append workers, builtin_local, cutoff, raft, 1ms flush.hist.png]]
+
+#+begin_src python :results file :exports result
+boxplot_vs(a1kdr1,"1000 append workers, raft",by='PayloadSize')
+#+end_src
+
+
+#+RESULTS:
+[[file:1000 append workers, raft.bp.png]]
+
+*** 1000 workers, no beamformer, local
+
+#+begin_src python :results file :exports result
+a1kdnls = df_append[((df_append['N'] == 1000) & (df_append['DB'] == 'dlns'))]
+histogram_vs(a1kdnls, "1000 append workers, builtin_local, no beamformer, 1ms flush")
+#+end_src
+
+#+RESULTS:
+[[file:1000 append workers, builtin_local, no beamformer, 1ms flush.hist.png]]
+
+#+begin_src python :results file :exports result
+boxplot_vs(a1kdnls,"1000 append workers, no beamformer local",by='PayloadSize')
+#+end_src
+
+
+#+RESULTS:
+[[file:1000 append workers, no beamformer local.bp.png]]
+
+
+
+
 * Appendix A: Test harness
 
 #+begin_src erlang :exports none
@@ -781,11 +929,11 @@ shuffle(L) ->
 
 clear_table(#{type := mria, db := DB}) ->
     mria:clear_table(DB);
-clear_table(#{type := ds, db := DB}) ->
+clear_table(#{db := DB}) ->
     maps:foreach(
         fun({Shard, Gen}, _Val) ->
             {atomic, _, _} = emqx_ds:trans(
-                #{db => DB, generation => Gen, shard => Shard},
+                #{db => DB, generation => Gen, shard => Shard, timeout => 120_000},
                 fun() ->
                     emqx_ds:tx_del_topic(['#'])
                 end
