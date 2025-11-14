@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_ds).
@@ -296,6 +296,17 @@ Common options for creation of a DS database.
 
   All databases in the group must use the same backend.
 
+- **`backup_order`** - an integer that affects the relative order of
+  the DB during taking of backup. The lower is the number, the earlier
+  the DB backup is taken in relation to other DBs. This parameter can
+  be used in the situations where data in one DB is logically
+  dependent on data in another. For example, `sessions` refer to data
+  on `messages`, so to avoid dangling iterators, `backup_order` of
+  `sessions` should be lower than that of `messages`.
+
+  The default value is 0.
+  Backups with the same priority are taken in an unspecified order.
+
 Note: all backends MUST handle all options listed here; even if it
 means throwing an exception that says that certain option is not
 supported.
@@ -305,6 +316,7 @@ supported.
         backend := backend(),
         payload_type => emqx_ds_payload_transform:type(),
         db_group => db_group(),
+        backup_order => integer(),
         %% Backend-specific options:
         _ => _
     }.
@@ -1901,7 +1913,7 @@ handle_open_db(DB, UserOpts = #{backend := Backend}, S0 = #s{dbs = DBs, groups =
                     GroupId = DB,
                     true
             end,
-        GlobalDefaults = #{payload_type => ?ds_pt_ttv, db_group => GroupId},
+        GlobalDefaults = #{payload_type => ?ds_pt_ttv, db_group => GroupId, backup_order => 0},
         Opts = emqx_utils_maps:deep_merge(
             emqx_utils_maps:deep_merge(
                 GlobalDefaults,

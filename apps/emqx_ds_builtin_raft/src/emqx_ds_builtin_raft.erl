@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_ds_builtin_raft).
 -moduledoc """
@@ -153,6 +153,7 @@ This is the entrypoint into the `builtin_raft` backend.
 
 -type db_runtime_config() :: #{
     db_group := emqx_ds:db_group(),
+    backup_order := integer(),
     reads => leader_preferred | local_preferred,
     %% TODO: clarify type
     replication_options := #{},
@@ -924,6 +925,7 @@ verify_db_opts(Opts) ->
         #{
             backend := builtin_raft,
             db_group := DBGroup,
+            backup_order := BUPp,
             payload_type := PType,
             n_shards := NShards,
             n_sites := NSites,
@@ -957,6 +959,7 @@ verify_db_opts(Opts) ->
         },
         RTOpts = #{
             db_group => DBGroup,
+            backup_order => BUPp,
             reads => Reads,
             replication_options => ReplOpts,
             subscriptions => Subs,

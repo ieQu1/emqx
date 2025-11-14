@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_ds_builtin_local).
 
@@ -121,6 +121,7 @@
 
 -type db_runtime_config() :: #{
     db_group := emqx_ds:db_group(),
+    backup_order := integer(),
     %% Beamformer
     subscriptions := emqx_ds_beamformer:opts(),
     %% Optimistic transaction:
@@ -593,6 +594,7 @@ verify_db_opts(Opts) ->
         #{
             backend := builtin_local,
             db_group := DBGroup,
+            backup_order := BUPOrder,
             payload_type := PType,
             n_shards := NShards,
             storage := Storage,
@@ -612,6 +614,7 @@ verify_db_opts(Opts) ->
         },
         RTOpts = #{
             db_group => DBGroup,
+            backup_order => BUPOrder,
             subscriptions => Subs,
             transactions => Trans,
             rocksdb => RocksDB

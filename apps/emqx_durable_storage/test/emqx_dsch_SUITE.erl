@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_dsch_SUITE).
 
@@ -754,6 +754,24 @@ t_200_gvars(_Config) ->
         ],
         L
     ).
+
+%% This testcase verifies `list_dbs_for_backup' function. It ensures
+%% that the list is sorted by `backup_order', and databases missing
+%% `backup_order' are not included.
+t_300_list_dbs_for_backup(_Config) ->
+    ok = emqx_dsch:register_backend(test, ?MODULE),
+    ?assertMatch({ok, _, _}, emqx_dsch:ensure_db_schema(db1, #{backend => test})),
+    ?assertMatch({ok, _, _}, emqx_dsch:ensure_db_schema(db2, #{backend => test})),
+    ?assertMatch({ok, _, _}, emqx_dsch:ensure_db_schema(db3, #{backend => test})),
+    %% Verify handling of invalid backup_order:
+    ?assertMatch(
+        {error, {invalid_backup_order, foo}}, emqx_dsch:open_db(db1, #{backup_order => foo})
+    ),
+    %% Test:
+    ?assertMatch(ok, emqx_dsch:open_db(db1, #{backup_order => 1})),
+    ?assertMatch(ok, emqx_dsch:open_db(db2, #{backup_order => 2})),
+    ?assertMatch(ok, emqx_dsch:open_db(db3, #{})),
+    ?assertEqual([db1, db2], emqx_dsch:list_dbs_for_backup()).
 
 handle_schema_event(DB, ChangeId, Task) ->
     ?tp(info, test_schema_change, #{db => DB, id => ChangeId, task => Task}),
