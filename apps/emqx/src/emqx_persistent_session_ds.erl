@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc This module implements an MQTT session that can survive the
@@ -1836,7 +1836,7 @@ set_timer(Timer, Time, Session) ->
 %%--------------------------------------------------------------------
 
 async_checkpoint(Session) ->
-    commit(Session, #{lifetime => up, sync => true}).
+    commit(Session, #{lifetime => up, sync => false}).
 
 commit(Session0 = #{s := S0}, Opts) ->
     ?tp(?sessds_commit, #{s => S0, opts => Opts}),
@@ -1845,10 +1845,11 @@ commit(Session0 = #{s := S0}, Opts) ->
     S = emqx_persistent_session_ds_state:commit(S1, Opts),
     Session = Session0#{s := S},
     Ret = cancel_state_commit_timer(Session),
-    {ok, FD} = file:open(
-        "/tmp/after_commit.eterm" ++ integer_to_list(erlang:unique_integer([positive, monotonic])),
-        [write]
+    Filename = io_lib:format(
+        "/tmp/after_commit.eterm.~p.~p",
+        [maps:get(collection_guard, S), erlang:unique_integer([positive, monotonic])]
     ),
+    {ok, FD} = file:open(lists:flatten(Filename), [write]),
     io:format(FD, "~p.", [
         #{
             opts => Opts,
@@ -1922,7 +1923,7 @@ packet_id_to_seqno_prop() ->
                         io:format(user, " *** CommittedSeqNo = ~p (-~p)~n",
                                   [CommittedSeqNo, ExpectedSeqNo - CommittedSeqNo]),
                         io:format(user, " *** PacketID = ~p~n", [PacketId]),
-                        io:format(user, " *** Derived = ~p -> ~p~n", [SeqNo])
+                        io:format(user, " *** Derived = ~p~n", [SeqNo])
                     end,
                     PacketId < 16#10000 andalso SeqNo =:= ExpectedSeqNo
                 )
