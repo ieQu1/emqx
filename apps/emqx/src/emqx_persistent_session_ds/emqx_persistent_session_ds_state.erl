@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc CRUD interface for the persistent session
@@ -207,8 +207,10 @@ format(Rec = #{?id := Id}) ->
         fun(MapKey, #pmap{cache = Val}, Acc) ->
             Acc#{MapKey => Val}
         end,
-        #{?id => Id},
-        maps:without([?id, ?collection_dirty, ?collection_guard, ?checkpoint_ref, ?last_id], Rec)
+        #{?id => Id, '_' => maps:get('_', Rec, undefined)},
+        maps:without(
+            [?id, ?collection_dirty, ?collection_guard, ?checkpoint_ref, ?last_id, '_'], Rec
+        )
     ),
     maps:merge(Pmaps, maps:with([?collection_dirty, ?collection_guard, ?checkpoint_ref], Rec)).
 
@@ -280,7 +282,8 @@ create_new(SessionId) ->
         ?seqnos => emqx_persistent_session_ds_state_v2:new_pmap(?seqnos),
         ?streams => emqx_persistent_session_ds_state_v2:new_pmap(?streams),
         ?ranks => emqx_persistent_session_ds_state_v2:new_pmap(?ranks),
-        ?awaiting_rel => emqx_persistent_session_ds_state_v2:new_pmap(?awaiting_rel)
+        ?awaiting_rel => emqx_persistent_session_ds_state_v2:new_pmap(?awaiting_rel),
+        ?new_pmap_collection
     }.
 
 -spec is_dirty(t()) -> boolean().

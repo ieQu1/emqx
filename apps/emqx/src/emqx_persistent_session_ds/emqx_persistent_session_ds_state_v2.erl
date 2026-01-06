@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2025-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc This module implements second version of durable encoding of
@@ -435,7 +435,8 @@ open_tx(ClientId) ->
                 ?seqnos => emqx_ds_pmap:tx_restore(?MODULE, ?top_seqnos, ClientId),
                 ?streams => emqx_ds_pmap:tx_restore(?MODULE, ?top_streams, ClientId),
                 ?ranks => emqx_ds_pmap:tx_restore(?MODULE, ?top_ranks, ClientId),
-                ?awaiting_rel => emqx_ds_pmap:tx_restore(?MODULE, ?top_awaiting_rel, ClientId)
+                ?awaiting_rel => emqx_ds_pmap:tx_restore(?MODULE, ?top_awaiting_rel, ClientId),
+                ?new_pmap_collection
             },
             {ok, Ret}
     end.

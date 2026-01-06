@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc This module encapsulates the data related to the client's
@@ -100,7 +100,7 @@
     fun((emqx_persistent_session_ds:topic_filter(), subscription(), Acc) -> Acc),
     Acc,
     emqx_persistent_session_ds_state:t(),
-    Include :: [direct | shared]
+    Include :: [direct | durable | shared]
 ) ->
     Acc.
 fold(Fun, Acc0, S, Includes) ->
@@ -337,20 +337,20 @@ change_to_direct(TopicFilter, SState, SessionId, S0) ->
     ok = delete_route(durable, SessionId, TopicFilter),
     S.
 
--spec on_session_drop(emqx_persistent_session_ds:id(), emqx_persistent_session_ds_state:t()) -> ok.
+-spec on_session_drop(emqx_persistent_session_ds:id(), emqx_persistent_session_ds_state:t()) ->
+    emqx_persistent_session_ds_state:t().
 on_session_drop(SessionId, S0) ->
-    _ = fold(
-        fun(TopicFilter, _Subscription, S) ->
-            case on_unsubscribe(SessionId, TopicFilter, S) of
-                {ok, S1, _} -> S1;
-                _ -> S
+    fold(
+        fun(TopicFilter, _Subscription, S1) ->
+            case on_unsubscribe(SessionId, TopicFilter, S1) of
+                {ok, S, _} -> S;
+                _ -> S1
             end
         end,
         S0,
         S0,
-        [direct]
-    ),
-    ok.
+        [direct, durable]
+    ).
 
 %% @doc Remove subscription states that don't have a parent, and that
 %% don't have any unacked messages.

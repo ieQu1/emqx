@@ -926,7 +926,7 @@ on_enqueue(
 %%--------------------------------------------------------------------
 
 -spec disconnect(session(), emqx_types:conninfo()) -> {shutdown, session()}.
-disconnect(Session = #{id := Id, s := S0, shared_sub_s := SharedSubS0}, ConnInfo) ->
+disconnect(Session0 = #{id := Id, s := S0, shared_sub_s := SharedSubS0}, ConnInfo) ->
     S1 = maybe_set_offline_info(S0, Id),
     S2 = emqx_persistent_session_ds_state:set_last_alive_at(now_ms(), S1),
     S3 =
@@ -937,11 +937,13 @@ disconnect(Session = #{id := Id, s := S0, shared_sub_s := SharedSubS0}, ConnInfo
                 S2
         end,
     {S, SharedSubS} = emqx_persistent_session_ds_shared_subs:on_disconnect(S3, SharedSubS0),
-    {shutdown, async_checkpoint(Session#{s := S, shared_sub_s := SharedSubS})}.
+    Session = Session0#{s := S, shared_sub_s := SharedSubS},
+    %%{shutdown, Session#{s := S, shared_sub_s := SharedSubS}}.
+    {shutdown, commit(Session, #{lifetime => up, sync => false, blah => disconnect})}.
 
 -spec terminate(emqx_types:clientinfo(), Reason :: term(), session()) -> ok.
 terminate(ClientInfo, Reason, Session = #{s := S, id := Id, will_msg := MaybeWillMsg}) ->
-    _ = commit(Session#{s := S}, #{lifetime => terminate, sync => true}),
+    _ = commit(Session, #{lifetime => terminate, sync => true}),
     SessExpiryInterval = emqx_persistent_session_ds_state:get_expiry_interval(S),
     ok = emqx_persistent_session_ds_gc_timer:on_disconnect(Id, SessExpiryInterval),
     ok = emqx_durable_will:on_disconnect(Id, ClientInfo, SessExpiryInterval, MaybeWillMsg),
@@ -1083,8 +1085,8 @@ session_drop(SessionId, Reason) ->
     case emqx_persistent_session_ds_state:open(SessionId) of
         {ok, S0} ->
             ?tp(debug, ?sessds_drop, #{client_id => SessionId, reason => Reason}),
-            ok = emqx_persistent_session_ds_subs:on_session_drop(SessionId, S0),
-            ok = emqx_persistent_session_ds_state:delete(S0),
+            S1 = emqx_persistent_session_ds_subs:on_session_drop(SessionId, S0),
+            ok = emqx_persistent_session_ds_state:delete(S1),
             emqx_persistent_session_ds_gc_timer:delete(SessionId);
         undefined ->
             ok
@@ -1834,14 +1836,30 @@ set_timer(Timer, Time, Session) ->
 %%--------------------------------------------------------------------
 
 async_checkpoint(Session) ->
-    commit(Session, #{lifetime => up, sync => false}).
+    commit(Session, #{lifetime => up, sync => true}).
 
 commit(Session0 = #{s := S0}, Opts) ->
     ?tp(?sessds_commit, #{s => S0, opts => Opts}),
+    T0 = erlang:monotonic_time(microsecond),
     S1 = emqx_persistent_session_ds_subs:gc(emqx_persistent_session_ds_stream_scheduler:gc(S0)),
     S = emqx_persistent_session_ds_state:commit(S1, Opts),
     Session = Session0#{s := S},
-    cancel_state_commit_timer(Session).
+    Ret = cancel_state_commit_timer(Session),
+    {ok, FD} = file:open(
+        "/tmp/after_commit.eterm" ++ integer_to_list(erlang:unique_integer([positive, monotonic])),
+        [write]
+    ),
+    io:format(FD, "~p.", [
+        #{
+            opts => Opts,
+            before => Session0,
+            after_ => Session,
+            t0 => T0,
+            t1 => erlang:monotonic_time(microsecond)
+        }
+    ]),
+    ok = file:close(FD),
+    Ret.
 
 -spec ensure_state_commit_timer(session()) -> session().
 ensure_state_commit_timer(#{s := S} = Session) ->

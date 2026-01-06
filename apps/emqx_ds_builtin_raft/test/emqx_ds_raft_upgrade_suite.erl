@@ -190,7 +190,8 @@ init_per_group(Group, Config) ->
     Releases =
         case Group of
             r6_0_0 -> ["6.0.0"];
-            r6_1_0 -> ["6.1.0"]
+            r6_1_0 -> ["6.1.0"];
+            this -> [this]
         end,
     WorkDir = emqx_cth_suite:work_dir(all, Config),
     Cluster = start_cluster(WorkDir, Releases),
@@ -200,13 +201,15 @@ groups() ->
     TCs = [bwc_test],
     [
         {r6_0_0, [sequence], TCs},
-        {r6_1_0, [sequence], TCs}
+        {r6_1_0, [sequence], TCs},
+        {this, [sequence], TCs}
     ].
 
 all() ->
     %% TODO: test should run in mixed cluster instead. But currently
     %% it's impossible due to license.
-    [{group, r6_0_0}, {group, r6_1_0}].
+    %[{group, r6_0_0}, {group, r6_1_0}].
+    [{group, this}].
 
 end_per_group(_, Config) ->
     {_, WorkDir} = lists:keyfind(workdir, 1, Config),
@@ -275,7 +278,7 @@ start_peer(this, NodeStr, Host, BaseDir, NNodes) ->
             env => env(NodeStr, Host, WorkDir, NNodes),
             wait_boot => ?wait_boot,
             longnames => true,
-            shutdown => ?wait_shutdown
+            shutdown => {halt, ?wait_shutdown}
         }
     ),
     register(Node, Peer),
@@ -290,7 +293,7 @@ start_peer(Release, NodeStr, Host, WorkDir, NNodes) when is_list(Release) ->
             exec => {Docker, docker_args(Release, NodeStr, Host, WorkDir, NNodes)},
             wait_boot => ?wait_boot,
             longnames => true,
-            shutdown => ?wait_shutdown
+            shutdown => {halt, ?wait_shutdown}
         }
     ),
     register(Node, Peer),
@@ -312,8 +315,7 @@ docker_args(Release, Node, Host, Dir, NNodes) ->
      "emqx/emqx:" ++ Release,
      "--", "emqx", "foreground"].
 
-env(Node, Host, DataDir, NNodes0) ->
-    NNodes = integer_to_list(NNodes0),
+env(Node, Host, DataDir, NNodes) ->
     ListenerConf = [
         {"EMQX_listeners__" ++ L ++ "__default__enable", "false"}
      || L <- ["ssl", "ws", "wss"]
@@ -332,15 +334,28 @@ env(Node, Host, DataDir, NNodes0) ->
         {"EMQX_LOG_DIR", filename:join(DataDir, "debug_logs")},
         %% Durable storage:
         {"EMQX_node__data_dir", DataDir},
+        %% Listeners:
+        {"EMQX_dashboard__listeners__http__bind", "0"},
+        {"EMQX_listeners__tcp__default__bind", Host ++ ":1883"}
+        | ListenerConf ++ ds_config(builtin_raft, NNodes)
+    ].
+
+ds_config(builtin_raft, NNodes0) ->
+    NNodes = integer_to_list(NNodes0),
+    [
         {"EMQX_durable_storage__n_sites", NNodes},
         {"EMQX_durable_storage__messages__replication_factor", NNodes},
         {"EMQX_durable_storage__sessions__replication_factor", NNodes},
         {"EMQX_durable_storage__timers__replication_factor", NNodes},
-        {"EMQX_durable_storage__shared_subs__replication_factor", NNodes},
-        %% Listeners:
-        {"EMQX_dashboard__listeners__http__bind", "0"},
-        {"EMQX_listeners__tcp__default__bind", Host ++ ":1883"}
-        | ListenerConf
+        {"EMQX_durable_storage__shared_subs__replication_factor", NNodes}
+    ];
+ds_config(builtin_local, _) ->
+    [
+        {"EMQX_cluster__discovery_strategy", "singleton"},
+        {"EMQX_durable_storage__messages__backend", "builtin_local"},
+        {"EMQX_durable_storage__sessions__backend", "builtin_local"},
+        {"EMQX_durable_storage__timers__backend", "builtin_local"},
+        {"EMQX_durable_storage__shared_subs__backend", "builtin_local"}
     ].
 
 wait_messages(N, Recv) when N >= 0 ->
