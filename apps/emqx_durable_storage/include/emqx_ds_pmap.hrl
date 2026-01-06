@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2025-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -ifndef(EMQX_DS_PMAP_HRL).
 -define(EMQX_DS_PMAP_HRL, true).
@@ -35,13 +35,17 @@
 -define(collection_guard, collection_guard).
 -define(collection_dirty, collection_dirty).
 
+%% -define(CHECK_SEQNO, true).
+
 %% Enable this flag if you suspect some code breaks the sequence:
 -ifndef(CHECK_SEQNO).
 -define(set_dirty, ?collection_dirty := true).
 -define(unset_dirty, ?collection_dirty := false).
+-define(new_pmap_collection, '_' => 0).
 -else.
 -define(set_dirty, ?collection_dirty := true, '_' => emqx_ds_pmap:do_seqno()).
 -define(unset_dirty, ?collection_dirty := false, '_' => emqx_ds_pmap:do_seqno()).
+-define(new_pmap_collection, '_' => emqx_ds_pmap:new_seqno()).
 -endif.
 
 -endif.
