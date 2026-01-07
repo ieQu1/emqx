@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2025-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_ds_shared_sub_dl).
 -moduledoc """
@@ -165,7 +165,8 @@ create_new(Id) ->
         ?collection_guard => undefined,
         ?properties => emqx_ds_pmap:new_pmap(?MODULE, ?top_properties),
         ?generations => emqx_ds_pmap:new_pmap(?MODULE, ?top_generations),
-        ?iterators => emqx_ds_pmap:new_pmap(?MODULE, ?top_iterators)
+        ?iterators => emqx_ds_pmap:new_pmap(?MODULE, ?top_iterators),
+        ?new_pmap_collection
     }.
 
 -spec commit(lifetime(), t()) -> t().
@@ -421,7 +422,8 @@ open_tx(Id) ->
                 ?collection_dirty => false,
                 ?properties => emqx_ds_pmap:tx_restore(?MODULE, ?top_properties, Id),
                 ?generations => emqx_ds_pmap:tx_restore(?MODULE, ?top_generations, Id),
-                ?iterators => emqx_ds_pmap:tx_restore(?MODULE, ?top_iterators, Id)
+                ?iterators => emqx_ds_pmap:tx_restore(?MODULE, ?top_iterators, Id),
+                ?new_pmap_collection
             },
             {ok, Rec}
     end.

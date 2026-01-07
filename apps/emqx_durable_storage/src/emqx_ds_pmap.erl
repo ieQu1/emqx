@@ -368,14 +368,12 @@ collection_size(Field, Rec) ->
 
 -ifdef(CHECK_SEQNO).
 do_seqno() ->
-    N = erlang:get(?MODULE),
-    ?assert(is_integer(N)),
-    put(?MODULE, N + 1),
-    N + 1.
+    Ref = make_ref(),
+    put(?MODULE, Ref),
+    Ref.
 
 new_seqno() ->
-    put(?MODULE, 0),
-    0.
+    do_seqno().
 
 -spec collection_check_sequence(collection()) -> ok.
 collection_check_sequence(#{'_' := CollectionSeqNo}) ->

@@ -35,7 +35,7 @@
 -define(collection_guard, collection_guard).
 -define(collection_dirty, collection_dirty).
 
-%-define(CHECK_SEQNO, true).
+-define(CHECK_SEQNO, true).
 
 %% Enable this flag if you suspect some code breaks the sequence:
 -ifndef(CHECK_SEQNO).

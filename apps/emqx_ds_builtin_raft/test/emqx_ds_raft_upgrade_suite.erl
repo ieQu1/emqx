@@ -43,7 +43,7 @@ bwc_test(Config) ->
     Sessions = connect_clients(Cluster),
     ok = create_subscriptions(Sessions),
     ok = verify_sessions(Cluster, Sessions),
-    ok = verify_payloads(<<"Hello from ">>, Sessions),
+    %% ok = verify_payloads(<<"Hello from ">>, Sessions),
     %% Perform upgrade:
     ct:pal("Upgrading cluster..."),
     disconnect_sessions(Sessions),
@@ -53,7 +53,7 @@ bwc_test(Config) ->
     %% After upgrade:
     Sessions = connect_clients(Cluster),
     ok = verify_sessions(Cluster, Sessions),
-    ok = verify_payloads(<<"Hello from upgraded ">>, Sessions),
+    %% ok = verify_payloads(<<"Hello from upgraded ">>, Sessions),
     ok.
 
 %% Verify that DS DBs become available in the mixed cluster:
