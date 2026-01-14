@@ -28,7 +28,8 @@ defmodule EMQXDurableStorage.MixProject do
       %{src: "asn.1/DSMetadataCommon.asn", compile_opts: [:per | common]},
       %{src: "asn.1/DSBuiltinMetadata.asn", compile_opts: [:per | common]},
       %{src: "asn.1/DSBuiltinSLSkipstreamV2.asn", compile_opts: [:per | common]},
-      %{src: "asn.1/DurableMessage.asn", compile_opts: [:per | common]}
+      %{src: "asn.1/DurableMessage.asn", compile_opts: [:per | common]},
+      %{src: "asn.1/DSBackup.asn", compile_opts: [:ber | common]}
     ]
   end
 

@@ -1,0 +1,11 @@
+-- This schema specifies binary encoding of various metadata that goes into the durable storage backup.
+
+DSBackup DEFINITIONS AUTOMATIC TAGS ::=
+BEGIN
+  -- State of the optimistic transaction worker for the shard:
+  OptimisticTxWorkerState ::= SEQUENCE {
+    vsn [0] OCTET STRING,
+    committedSerial [1] INTEGER OPTIONAL,
+    lastTimestamp [2] INTEGER OPTIONAL
+  }
+END
