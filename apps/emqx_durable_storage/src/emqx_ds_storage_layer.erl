@@ -20,6 +20,7 @@
     %% Generations
     update_config/3,
     add_generation/2,
+    add_generation/3,
     list_slabs/1,
     drop_slab/2,
     find_generation/2,
@@ -34,9 +35,7 @@
     accept_snapshot/1,
 
     %% Custom events
-    handle_event/3,
-    %% Misc:
-    rid_of_dskeys/1
+    handle_event/3
 ]).
 
 %% gen_server
@@ -60,7 +59,9 @@
     get_gvars/1,
     ls_shards/1,
     get_stats/1,
-    db_group_stats/2
+    db_group_stats/2,
+    %% For debugging and test:
+    get_schema_runtime/1
 ]).
 
 -export_type([
@@ -68,8 +69,7 @@
     batch_prepare_opts/0,
     batch_store_opts/0,
     gen_id/0,
-    generation/0,
-    generation_data/0,
+    generation_runtime/0,
     cf_refs/0,
     stream/0,
     iterator/0,
@@ -80,6 +80,9 @@
     event_dispatch_f/0,
     db_group/0
 ]).
+
+-deprecated({update_config, 3, "Use update_config_v2/3 instead"}).
+-deprecated({add_generation, 2, "Use add_generation/3 instead"}).
 
 -include("emqx_ds.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
@@ -175,7 +178,7 @@
 
 -define(GEN_KEY(GEN_ID), {generation, GEN_ID}).
 
--type generation(Data) :: #{
+-type generation_data(Data) :: #{
     %% Module that handles data for the generation:
     module := module(),
     %% Module-specific data defined at generation creation time:
@@ -193,18 +196,17 @@
     until := emqx_ds:time() | undefined
 }.
 
-%% Module-specific runtime data, as instantiated by `Mod:open/5` callback function.
--type generation_data() :: term().
 
 %% Schema for a generation. Persistent term.
--type generation_schema() :: generation(term()).
+-type generation_schema() :: generation_data(term()).
 
-%% Runtime view of generation:
--type generation() :: generation(generation_data()).
+%% Runtime view of generation. Module-specific runtime data, as
+%% instantiated by `Mod:open/5` callback function.
+-type generation_runtime() :: generation_data(term()).
 
 %%%% Shard:
 
--type shard(GenData) :: #{
+-type shard_data(GenData) :: #{
     %% ID of the current generation (where the new data is written):
     current_generation := gen_id(),
     %% This data is used to create new generation:
@@ -219,10 +221,10 @@
 }.
 
 %% Shard schema (persistent):
--type shard_schema() :: shard(generation_schema()).
+-type shard_schema() :: shard_data(generation_schema()).
 
 %% Shard (runtime):
--type shard() :: shard(generation()).
+-type shard() :: shard_data(generation_runtime()).
 
 %% Which DB options to provide to the storage layout module:
 %% See `emqx_ds:db_opts()`.
@@ -313,7 +315,7 @@ check_soft_quota(#db_group{sst_file_mgr = SSTFM, conf = #{storage_quota := Quota
     Usage < Quota.
 
 %% Note: we specify gen_server requests as records to make use of Dialyzer:
--record(call_add_generation, {since :: emqx_ds:time()}).
+-record(call_add_generation, {since :: emqx_ds:time(), prototype :: undefined | prototype()}).
 -record(call_update_config, {options :: emqx_ds:create_db_opts(), since :: emqx_ds:time()}).
 -record(call_list_generations_with_lifetimes, {}).
 -record(call_drop_generation, {gen_id :: gen_id()}).
@@ -383,6 +385,11 @@ update_config(ShardId, Since, Options) ->
     ok | {error, overlaps_existing_generations}.
 add_generation(ShardId, Since) ->
     gen_server:call(?REF(ShardId), #call_add_generation{since = Since}, infinity).
+
+-spec add_generation(dbshard(), emqx_ds:time(), prototype()) ->
+    ok | {error, overlaps_existing_generations}.
+add_generation(ShardId, Since, Prototype) when Prototype =/= undefined ->
+    gen_server:call(?REF(ShardId), #call_add_generation{since = Since, prototype = Prototype}, infinity).
 
 -spec list_slabs(dbshard()) ->
     #{gen_id() => slab_info()}.
@@ -560,8 +567,16 @@ handle_call(#call_update_config{since = Since, options = Options}, _From, S0) ->
         Error = {error, _} ->
             {reply, Error, S0}
     end;
-handle_call(#call_add_generation{since = Since}, _From, S0) ->
-    case handle_add_generation(S0, Since) of
+handle_call(#call_add_generation{since = Since, prototype = undefined}, _From, S0) ->
+    case handle_add_generation_v0(S0, Since) of
+        S = #s{} ->
+            commit_metadata(S),
+            {reply, ok, S};
+        Error = {error, _} ->
+            {reply, Error, S0}
+    end;
+handle_call(#call_add_generation{since = Since, prototype = Prototype}, _From, S0) ->
+    case handle_add_generation_v1(S0, Since, Prototype) of
         S = #s{} ->
             commit_metadata(S),
             {reply, ok, S};
@@ -645,9 +660,45 @@ open_shard(ShardId, DB, CFRefs, ShardSchema) ->
         gvars => ets:new(emqx_ds_storage_layer_gvars, [set, public, {read_concurrency, true}])
     }.
 
--spec handle_add_generation(server_state(), emqx_ds:time()) ->
+-spec handle_add_generation_v1(server_state(), emqx_ds:time(), prototype()) ->
     server_state() | {error, overlaps_existing_generations}.
-handle_add_generation(
+handle_add_generation_v1(
+    S0 = #s{
+        shard_id = ShardId,
+        db = DB,
+        db_opts = DBOpts,
+        schema = Schema0,
+        shard = Shard0,
+        cf_refs = CFRefs0
+    },
+    Since,
+    Prototype
+) ->
+    Schema1 = update_last_until(Schema0, Since),
+    Shard1 = update_last_until(Shard0, Since),
+    case Schema1 of
+        _Updated = #{} ->
+            {GenId, Schema, NewCFRefs} =
+                new_generation(ShardId, DB, Schema1, Shard0, Since, DBOpts),
+            CFRefs = NewCFRefs ++ CFRefs0,
+            Key = ?GEN_KEY(GenId),
+            Generation = open_generation(ShardId, DB, CFRefs, GenId, maps:get(Key, Schema)),
+            Shard = Shard1#{current_generation := GenId, Key => Generation},
+            S0#s{
+                cf_refs = CFRefs,
+                schema = Schema,
+                shard = Shard
+            };
+        {error, exists} ->
+            S0;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Note: old and broken
+-spec handle_add_generation_v0(server_state(), emqx_ds:time()) ->
+    server_state() | {error, overlaps_existing_generations}.
+handle_add_generation_v0(
     S0 = #s{
         shard_id = ShardId,
         db = DB,
@@ -681,10 +732,12 @@ handle_add_generation(
 
 -spec handle_update_config(server_state(), emqx_ds:time(), emqx_ds:create_db_opts()) ->
     server_state() | {error, overlaps_existing_generations}.
-handle_update_config(S0 = #s{schema = Schema}, Since, Options) ->
+handle_update_config(S0 = #s{schema = Schema, shard_id = Shard}, Since, Options) ->
+    ?tp(debug, ds_storage_layer_update_config, #{shard_id => Shard, since => Since, options => Options}),
     Prototype = maps:get(storage, Options),
     S = S0#s{schema = Schema#{prototype := Prototype}},
-    handle_add_generation(S, Since).
+    ?tp(error, "OHAYO: updated", #{shard => Shard, prototype => Prototype, s => S}),
+    handle_add_generation_v0(S, Since).
 
 -spec handle_list_generations_with_lifetimes(server_state()) -> #{gen_id() => map()}.
 handle_list_generations_with_lifetimes(#s{schema = ShardSchema}) ->
@@ -757,7 +810,7 @@ handle_drop_generation(S0, GenId) ->
     {ok, S}.
 
 -spec open_generation(dbshard(), rocksdb:db_handle(), cf_refs(), gen_id(), generation_schema()) ->
-    generation().
+    generation_runtime().
 open_generation(ShardId, DB, CFRefs, GenId, GenSchema) ->
     ?tp(debug, ds_open_generation, #{gen_id => GenId, schema => GenSchema}),
     #{module := Mod, data := Schema} = GenSchema,
@@ -1006,12 +1059,6 @@ handle_event(Shard, Time, Event) ->
     GenId = generation_current(Shard),
     handle_event(Shard, Time, ?mk_storage_event(GenId, Event)).
 
--spec rid_of_dskeys([{K, V}]) -> [V] when
-    K :: emqx_ds:message_key(),
-    V :: emqx_ds:payload().
-rid_of_dskeys(L) ->
-    [P || {_, P} <- L].
-
 filter_layout_db_opts(Options) ->
     maps:with(?STORAGE_LAYOUT_DB_OPTS, Options).
 
@@ -1031,13 +1078,6 @@ cf_handle(Name, CFRefs) ->
     element(2, cf_ref(Name, CFRefs)).
 
 %%--------------------------------------------------------------------------------
-%% Metadata serialization
-%%--------------------------------------------------------------------------------
-
--define(meta_generic, 0:8).
--define(meta_lts_v1, 1:8).
-
-%%--------------------------------------------------------------------------------
 %% Schema access
 %%--------------------------------------------------------------------------------
 
@@ -1047,7 +1087,7 @@ generation_current(Shard) ->
     Current.
 
 %% TODO: remove me
--spec generation_at(dbshard(), emqx_ds:time()) -> {gen_id(), generation()} | not_found.
+-spec generation_at(dbshard(), emqx_ds:time()) -> {gen_id(), generation_runtime()} | not_found.
 generation_at(Shard, Time) ->
     Schema = #{current_generation := Current} = get_schema_runtime(Shard),
     generation_at(Time, Current, Schema).
@@ -1065,7 +1105,7 @@ generation_at(Time, GenId, Schema) ->
             not_found
     end.
 
--spec generation_get(dbshard(), gen_id()) -> generation() | not_found.
+-spec generation_get(dbshard(), gen_id()) -> generation_runtime() | not_found.
 generation_get(Shard, GenId) ->
     case get_schema_runtime(Shard) of
         #{?GEN_KEY(GenId) := GenData} ->

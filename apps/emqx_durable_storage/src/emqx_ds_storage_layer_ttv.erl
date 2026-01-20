@@ -71,7 +71,7 @@
     rocksdb:db_handle(),
     emqx_ds:generation(),
     Options :: map(),
-    emqx_ds_storage_layer:generation_data() | undefined,
+    emqx_ds_storage_layer:generation_data_0() | undefined,
     emqx_ds:db_opts()
 ) ->
     {_Schema, emqx_ds_storage_layer:cf_refs()}.
@@ -84,7 +84,7 @@
     emqx_ds_storage_layer:cf_refs(),
     _Schema
 ) ->
-    emqx_ds_storage_layer:generation_data().
+    emqx_ds_storage_layer:generation_data_0().
 
 %% Delete the schema and data
 -callback drop(
@@ -92,14 +92,14 @@
     rocksdb:db_handle(),
     emqx_ds:generation(),
     emqx_ds_storage_layer:cf_refs(),
-    emqx_ds_storage_layer:generation_data()
+    emqx_ds_storage_layer:generation_data_0()
 ) ->
     ok | {error, _Reason}.
 
 -callback prepare_tx(
     emqx_ds_storage_layer:dbshard(),
     emqx_ds_payload_transform:schema(),
-    emqx_ds_storage_layer:generation_data(),
+    emqx_ds_storage_layer:generation_data_0(),
     emqx_ds:tx_serial(),
     map(),
     _TxWrites :: [
@@ -111,14 +111,14 @@
 
 -callback commit_batch(
     emqx_ds_storage_layer:dbshard(),
-    emqx_ds_storage_layer:generation_data(),
+    emqx_ds_storage_layer:generation_data_0(),
     [cooked_tx()],
     emqx_ds_storage_layer:batch_store_opts()
 ) -> ok | emqx_ds:error(_).
 
 -callback get_streams(
     emqx_ds_storage_layer:dbshard(),
-    emqx_ds_storage_layer:generation_data(),
+    emqx_ds_storage_layer:generation_data_0(),
     emqx_ds:topic_filter(),
     emqx_ds:time()
 ) ->
@@ -127,7 +127,7 @@
 -callback make_iterator(
     emqx_ds:db(),
     emqx_ds:shard(),
-    emqx_ds_storage_layer:generation_data(),
+    emqx_ds_storage_layer:generation_data_0(),
     inner_stream(),
     emqx_ds:topic_filter(),
     emqx_ds:time()
@@ -136,14 +136,14 @@
 
 -callback unpack_iterator(
     emqx_ds_beamformer:dbshard(),
-    emqx_ds_storage_layer:generation_data(),
+    emqx_ds_storage_layer:generation_data_0(),
     it_static()
 ) ->
     {ok, inner_stream(), emqx_ds_beamformer:event_topic()} | emqx_ds:error(_).
 
 -callback lookup(
     emqx_ds_storage_layer:dbshard(),
-    emqx_ds_storage_layer:generation_data(),
+    emqx_ds_storage_layer:generation_data_0(),
     emqx_ds:topic(),
     emqx_ds:time()
 ) ->
@@ -152,7 +152,7 @@
 -callback next(
     emqx_ds:db(),
     emqx_ds:shard(),
-    emqx_ds_storage_layer:generation_data(),
+    emqx_ds_storage_layer:generation_data_0(),
     it_static(),
     it_pos(),
     pos_integer(),
@@ -165,7 +165,7 @@
 -callback fast_forward(
     emqx_ds:db(),
     emqx_ds:shard(),
-    emqx_ds_storage_layer:generation_data(),
+    emqx_ds_storage_layer:generation_data_0(),
     it_static(),
     it_pos(),
     _BatchSize :: pos_integer(),
@@ -177,7 +177,7 @@
 -callback scan_stream(
     emqx_ds:db(),
     emqx_ds:shard(),
-    emqx_ds_storage_layer:generation_data(),
+    emqx_ds_storage_layer:generation_data_0(),
     inner_stream(),
     emqx_ds_beamformer:event_topic_filter(),
     it_pos(),
@@ -189,13 +189,13 @@
 
 -callback batch_events(
     emqx_ds_storage_layer:dbshard(),
-    emqx_ds_storage_layer:generation_data(),
+    emqx_ds_storage_layer:generation_data_0(),
     _CookedBatch,
     fun((inner_stream()) -> _)
 ) -> ok.
 
 -callback message_match_context(
-    emqx_ds_storage_layer:generation_data(),
+    emqx_ds_storage_layer:generation_data_0(),
     inner_stream(),
     it_pos(),
     emqx_ds:ttv()
@@ -203,7 +203,7 @@
     {ok, _MatchCtx}.
 
 -callback iterator_match_context(
-    emqx_ds_storage_layer:generation_data(),
+    emqx_ds_storage_layer:generation_data_0(),
     it_static(),
     it_pos()
 ) ->

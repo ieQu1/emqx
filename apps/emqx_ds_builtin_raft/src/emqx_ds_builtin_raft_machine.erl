@@ -80,12 +80,10 @@ dictionary, see `?pd_ra_*` macrodefs for details.
 -define(batches, 4).
 -define(otx_leader_pid, 5).
 -define(otx_timestamp, 6).
-%% Storage event:
--define(storage_event_payload, 2).
--define(now, 3).
 
 %% Core state of the replication, i.e. the state of ra machine.
 -type ra_state() :: #{
+    app_version => string(),
     %% Shard ID.
     db_shard := {emqx_ds:db(), emqx_ds:shard()},
 
@@ -105,7 +103,10 @@ dictionary, see `?pd_ra_*` macrodefs for details.
 
     %% Pid of the OTX leader process (used to verify that transaction
     %% was initiated during the term of the correct leader):
-    otx_leader_pid => pid() | undefined
+    otx_leader_pid => pid() | undefined,
+
+    %% Last generation
+    last_generation => integer() | undefined
 }.
 
 %% Commands. Each command is an entry in the replication log.
@@ -173,7 +174,7 @@ dictionary, see `?pd_ra_*` macrodefs for details.
 
 -spec add_generation(emqx_ds:time()) -> cmd_add_generation().
 add_generation(Since) when is_integer(Since) ->
-    #{?tag => add_generation, since => Since}.
+    #{?tag => add_generation_v2, since => Since}.
 
 -spec update_schema(emqx_dsch:pending_id(), emqx_dsch:site(), emqx_ds_builtin_raft:db_schema()) ->
     cmd_update_schema().
@@ -288,8 +289,8 @@ apply(
     #{db_shard := DBShard} = State
 ) ->
     ?tp(
-        info,
-        ds_ra_add_generation,
+        warning,
+        ds_ra_add_generation_v1,
         #{
             shard => DBShard,
             since => Since
@@ -303,17 +304,39 @@ apply(
     {State, Result, [Effect]};
 apply(
     RaftMeta,
+    #{?tag := add_generation_v2, since := Since},
+    #{db_shard := DBShard, schema := #{storage := Storage}}
+) ->
+    ?tp(
+        info,
+        ds_ra_add_generation_v2,
+        #{
+            shard => DBShard,
+            since => Since,
+            storage => Storage
+        }
+    ),
+    Result = emqx_ds_storage_layer:add_generation(DBShard, Since, Storage),
+    emqx_ds_beamformer:generation_event(DBShard),
+    Effect = release_log(RaftMeta, State),
+    Effect =/= {release_cursor, 0, State} andalso
+        ?tp(ds_ra_effects, #{effects => [Effect], meta => RaftMeta}),
+    {State, Result, [Effect]};
+apply(
+    RaftMeta,
     #{?tag := update_schema, pending_id := PendingId, originator := Site, schema := Schema},
     #{db_shard := DBShard, last_schema_changes := LSC, latest := Latest} = State0
 ) ->
     ?tp(
-        notice,
+        warning,
         ds_ra_update_config,
         #{
             shard => DBShard,
             schema => Schema,
             originator => Site,
-            pending_id => PendingId
+            pending_id => PendingId,
+            latest => Latest,
+            lsc => LSC
         }
     ),
     State =
