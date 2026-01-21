@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_ds_storage_layer).
 
@@ -20,7 +20,7 @@
     %% Generations
     update_config/3,
     add_generation/2,
-    add_generation/3,
+    add_generation/4,
     list_slabs/1,
     drop_slab/2,
     find_generation/2,
@@ -196,7 +196,6 @@
     until := emqx_ds:time() | undefined
 }.
 
-
 %% Schema for a generation. Persistent term.
 -type generation_schema() :: generation_data(term()).
 
@@ -315,7 +314,11 @@ check_soft_quota(#db_group{sst_file_mgr = SSTFM, conf = #{storage_quota := Quota
     Usage < Quota.
 
 %% Note: we specify gen_server requests as records to make use of Dialyzer:
--record(call_add_generation, {since :: emqx_ds:time(), prototype :: undefined | prototype()}).
+-record(call_add_generation, {
+    generation :: emqx_ds:generation() | undefined,
+    since :: emqx_ds:time(),
+    prototype :: undefined | prototype()
+}).
 -record(call_update_config, {options :: emqx_ds:create_db_opts(), since :: emqx_ds:time()}).
 -record(call_list_generations_with_lifetimes, {}).
 -record(call_drop_generation, {gen_id :: gen_id()}).
@@ -386,10 +389,14 @@ update_config(ShardId, Since, Options) ->
 add_generation(ShardId, Since) ->
     gen_server:call(?REF(ShardId), #call_add_generation{since = Since}, infinity).
 
--spec add_generation(dbshard(), emqx_ds:time(), prototype()) ->
+-spec add_generation(dbshard(), emqx_ds:generation(), emqx_ds:time(), prototype()) ->
     ok | {error, overlaps_existing_generations}.
-add_generation(ShardId, Since, Prototype) when Prototype =/= undefined ->
-    gen_server:call(?REF(ShardId), #call_add_generation{since = Since, prototype = Prototype}, infinity).
+add_generation(ShardId, Generation, Since, Prototype) when Prototype =/= undefined ->
+    gen_server:call(
+        ?REF(ShardId),
+        #call_add_generation{generation = Generation, since = Since, prototype = Prototype},
+        infinity
+    ).
 
 -spec list_slabs(dbshard()) ->
     #{gen_id() => slab_info()}.
@@ -567,7 +574,7 @@ handle_call(#call_update_config{since = Since, options = Options}, _From, S0) ->
         Error = {error, _} ->
             {reply, Error, S0}
     end;
-handle_call(#call_add_generation{since = Since, prototype = undefined}, _From, S0) ->
+handle_call(#call_add_generation{generation = undefined, since = Since, prototype = undefined}, _From, S0) ->
     case handle_add_generation_v0(S0, Since) of
         S = #s{} ->
             commit_metadata(S),
@@ -575,8 +582,8 @@ handle_call(#call_add_generation{since = Since, prototype = undefined}, _From, S
         Error = {error, _} ->
             {reply, Error, S0}
     end;
-handle_call(#call_add_generation{since = Since, prototype = Prototype}, _From, S0) ->
-    case handle_add_generation_v1(S0, Since, Prototype) of
+handle_call(#call_add_generation{generation = Generation, since = Since, prototype = Prototype}, _From, S0) ->
+    case handle_add_generation_v1(S0, Generation, Since, Prototype) of
         S = #s{} ->
             commit_metadata(S),
             {reply, ok, S};
@@ -660,7 +667,7 @@ open_shard(ShardId, DB, CFRefs, ShardSchema) ->
         gvars => ets:new(emqx_ds_storage_layer_gvars, [set, public, {read_concurrency, true}])
     }.
 
--spec handle_add_generation_v1(server_state(), emqx_ds:time(), prototype()) ->
+-spec handle_add_generation_v1(server_state(), emqx_ds:generation(), emqx_ds:time(), prototype()) ->
     server_state() | {error, overlaps_existing_generations}.
 handle_add_generation_v1(
     S0 = #s{
@@ -671,24 +678,38 @@ handle_add_generation_v1(
         shard = Shard0,
         cf_refs = CFRefs0
     },
+    NewGenerationId,
     Since,
-    Prototype
+    Prototype = {StorageEngine, StorageOptions}
 ) ->
-    Schema1 = update_last_until(Schema0, Since),
-    Shard1 = update_last_until(Shard0, Since),
-    case Schema1 of
-        _Updated = #{} ->
-            {GenId, Schema, NewCFRefs} =
-                new_generation(ShardId, DB, Schema1, Shard0, Since, DBOpts),
-            CFRefs = NewCFRefs ++ CFRefs0,
-            Key = ?GEN_KEY(GenId),
-            Generation = open_generation(ShardId, DB, CFRefs, GenId, maps:get(Key, Schema)),
-            Shard = Shard1#{current_generation := GenId, Key => Generation},
-            S0#s{
-                cf_refs = CFRefs,
-                schema = Schema,
-                shard = Shard
-            };
+    case get_generation(NewGenerationId, Schema0) of
+        {ok, #{module := StorageEngine, data := StorageOptions}} ->
+            %% Same as the existing generation, do nothing:
+            S0;
+        {ok, Schema} ->
+            {error, #{reason => incomplatible_generation_schema,
+                      new => Prototype,
+                      existing => {StorageEngine, StorageOptions}
+                     }};
+        undefined ->
+            case update_last_until(Schema0, Since) of
+                {error, Err} ->
+                    {error, Err};
+                Schema1 = #s{} ->
+            Shard1 = update_last_until(Shard0, Since),
+            case Schema1 of
+                _Updated = #{} ->
+                    {GenId, Schema, NewCFRefs} =
+                        new_generation(ShardId, DB, Schema1, Shard0, Since, DBOpts),
+                    CFRefs = NewCFRefs ++ CFRefs0,
+                    Key = ?GEN_KEY(GenId),
+                    Generation = open_generation(ShardId, DB, CFRefs, GenId, maps:get(Key, Schema)),
+                    Shard = Shard1#{current_generation := GenId, Key => Generation},
+                    S0#s{
+                      cf_refs = CFRefs,
+                      schema = Schema,
+                      shard = Shard
+                     };
         {error, exists} ->
             S0;
         {error, Reason} ->
@@ -733,7 +754,9 @@ handle_add_generation_v0(
 -spec handle_update_config(server_state(), emqx_ds:time(), emqx_ds:create_db_opts()) ->
     server_state() | {error, overlaps_existing_generations}.
 handle_update_config(S0 = #s{schema = Schema, shard_id = Shard}, Since, Options) ->
-    ?tp(debug, ds_storage_layer_update_config, #{shard_id => Shard, since => Since, options => Options}),
+    ?tp(debug, ds_storage_layer_update_config, #{
+        shard_id => Shard, since => Since, options => Options
+    }),
     Prototype = maps:get(storage, Options),
     S = S0#s{schema = Schema#{prototype := Prototype}},
     ?tp(error, "OHAYO: updated", #{shard => Shard, prototype => Prototype, s => S}),

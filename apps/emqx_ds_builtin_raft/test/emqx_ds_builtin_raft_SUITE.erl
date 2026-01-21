@@ -1055,9 +1055,15 @@ t_storage_config_change(Config) ->
         n_shards => 16, n_sites => 3, replication_factor => 3
     }),
     %% New DB configurations to be applied on different nodes:
-    NewConfN1 = #{storage => {emqx_ds_storage_skipstream_lts_v2, #{lts_threshold_spec => {simple, {10, inf}}}}},
-    NewConfN2 = #{storage => {emqx_ds_storage_skipstream_lts_v2, #{lts_threshold_spec => {simple, {20, inf}}}}},
-    NewConfN3 = #{storage => {emqx_ds_storage_skipstream_lts_v2, #{lts_threshold_spec => {simple, {30, inf}}}}},
+    NewConfN1 = #{
+        storage => {emqx_ds_storage_skipstream_lts_v2, #{lts_threshold_spec => {simple, {10, inf}}}}
+    },
+    NewConfN2 = #{
+        storage => {emqx_ds_storage_skipstream_lts_v2, #{lts_threshold_spec => {simple, {20, inf}}}}
+    },
+    NewConfN3 = #{
+        storage => {emqx_ds_storage_skipstream_lts_v2, #{lts_threshold_spec => {simple, {30, inf}}}}
+    },
     ?check_trace(
         #{timetrap => 60_000},
         begin
@@ -1065,24 +1071,24 @@ t_storage_config_change(Config) ->
             emqx_ds_raft_test_helpers:assert_db_open(Nodes, ?DB, DBOpts),
             %% Apply config changes:
             ?assertMatch(
-               ok,
-               ?ON(N1, emqx_ds:update_db_config(?DB, NewConfN1))
-              ),
+                ok,
+                ?ON(N1, emqx_ds:update_db_config(?DB, NewConfN1))
+            ),
             ?assertMatch(
-               ok,
-               ?ON(N2, emqx_ds:update_db_config(?DB, NewConfN2))
-              ),
+                ok,
+                ?ON(N2, emqx_ds:update_db_config(?DB, NewConfN2))
+            ),
             ?assertMatch(
-               ok,
-               ?ON(N3, emqx_ds:update_db_config(?DB, NewConfN3))
-              ),
+                ok,
+                ?ON(N3, emqx_ds:update_db_config(?DB, NewConfN3))
+            ),
             ?assertMatch(
-               [],
-               ?ON(N1, emqx_ds_storage_layer:get_schema_runtime({?DB, <<"0">>}))
-              )
+                [],
+                ?ON(N1, emqx_ds_storage_layer:get_schema_runtime({?DB, <<"0">>}))
+            )
         end,
-        []).
-
+        []
+    ).
 
 nodes_of_clientid(ClientId, Nodes) ->
     emqx_ds_raft_test_helpers:nodes_of_clientid(?DB, ClientId, Nodes).

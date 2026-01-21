@@ -153,7 +153,7 @@ state ("state version"), and the following logic applies:
     %% Note: v0 version predates version change protocol. To prevent
     %% it from mistakingly applying changes from the newer versions
     %% and corrupting the state, we renamed `db_shard' field starting
-    %% from v1 to `dbshard'. It will lead to ugly crashes, but prevent
+    %% from v1 to `dbshard'. It may lead to ugly crashes, but prevent
     %% state corruption.
     db_shard := {emqx_ds:db(), emqx_ds:shard()},
 
@@ -366,7 +366,13 @@ apply(RaftMeta, Command, State) ->
 %% Internal functions
 %%================================================================================
 
--spec apply(ra_machine:command_meta_data(), machine_version(), {emqx_ds:db(), emqx_ds:shard()}, ra_command(), ra_state()) ->
+-spec apply(
+    ra_machine:command_meta_data(),
+    machine_version(),
+    {emqx_ds:db(), emqx_ds:shard()},
+    ra_command(),
+    ra_state()
+) ->
     {ra_state(), _Reply, _Effects}.
 apply(
     RaftMeta,

@@ -37,7 +37,7 @@ backend can reject flush request.
     commit_kv_tx/4,
     tx_commit_outcome/1,
 
-         get_monotonic_timestamp/0
+    get_monotonic_timestamp/0
 ]).
 
 %% Internal exports
