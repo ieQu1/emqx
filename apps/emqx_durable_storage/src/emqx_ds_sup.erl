@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_ds_sup).
 
@@ -70,6 +70,13 @@ init(top) ->
             shutdown => 5_000
         },
         emqx_ds_builtin_metrics:child_spec(),
+        #{
+            id => backup,
+            start => {emqx_ds_backup, start_link, []},
+            type => worker,
+            restart => permanent,
+            shutdown => 5_000
+        },
         #{
             id => new_streams_watch_sup,
             start => {?MODULE, start_link_watch_sup, []},

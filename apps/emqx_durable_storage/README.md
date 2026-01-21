@@ -1,6 +1,6 @@
 # EMQX Durable Storage
 
-`emqx_durable_storage` (DS for short) is an application implementing durable storage for MQTT messages within EMQX.
+`emqx_durable_storage` (DS for short) is an embedded database for MQTT messages, session metadata and other applications within EMQX.
 
 The core design idea behind `emqx_durable_storage` is to store each message exactly once (per each replica of the database), regardless of the number of consumers, online or offline.
 This makes the storage disk requirements very predictable: only the number of _published_ messages matters; the number of consumers is removed from the equation, and fan-out is practically free in terms of disk storage.
@@ -71,7 +71,7 @@ Messages are organized in the following hierarchy:
 
 ## Saving messages to the durable storage
 
-`emqx_ds` provides `store_batch/3` function that saves a list of MQTT messages to the durable storage.
+`emqx_ds` provides `dirty_append/2` function that saves a list of MQTT messages to the durable storage.
 
 Additionally, `trans/2` function can be used to perform multiple read and write operations atomically.
 
