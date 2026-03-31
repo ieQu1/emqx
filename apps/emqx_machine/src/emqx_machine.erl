@@ -10,6 +10,9 @@
     brutal_shutdown/0,
     is_ready/0,
 
+    setup_classy_hooks/0,
+    on_run_level/2,
+
     node_status/0
 ]).
 
@@ -45,7 +48,15 @@ start() ->
     _ = application:load(emqx),
     mria_config:register_callback(lb_custom_info, fun ?MODULE:mria_lb_custom_info/0),
     mria_config:register_callback(lb_custom_info_check, fun ?MODULE:mria_lb_custom_info_check/1),
+    application:set_env(classy, setup_hooks, {?MODULE, setup_classy_hooks, []}),
+    {ok, _} = application:ensure_all_started(classy),
     ekka:start(),
+    ok.
+
+setup_classy_hooks() ->
+    classy:run_level(fun ?MODULE:on_run_level/1, 0).
+
+on_run_level(_, _) ->
     ok.
 
 graceful_shutdown() ->

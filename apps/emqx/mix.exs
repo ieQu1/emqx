@@ -69,6 +69,7 @@ defmodule EMQX.MixProject do
         :gproc,
         :gen_rpc,
         :ekka,
+        :classy,
         :esockd,
         :cowboy,
         :lc,

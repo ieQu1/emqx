@@ -177,6 +177,8 @@ defmodule EMQXUmbrella.MixProject do
 
   def common_dep(:ekka), do: {:ekka, github: "emqx/ekka", tag: "0.23.5", override: true}
 
+  def common_dep(:classy), do: {:classy, path: "/home/me/Documents/work/classy/"}
+
   def common_dep(:esockd),
     do: {:esockd, github: "emqx/esockd", tag: "5.16.1", override: true}
 
