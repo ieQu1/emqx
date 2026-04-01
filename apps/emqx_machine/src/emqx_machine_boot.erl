@@ -42,7 +42,7 @@
 post_boot() ->
     ok = ensure_apps_started(),
     ok = print_vsn(),
-    ok = start_autocluster(),
+    %% ok = start_autocluster(),
     ignore.
 
 -ifdef(TEST).

@@ -46,11 +46,11 @@ start() ->
     %% match of the version of EMQX OTP application:
     _ = application:load(mria),
     _ = application:load(emqx),
+    _ = application:load(classy),
     mria_config:register_callback(lb_custom_info, fun ?MODULE:mria_lb_custom_info/0),
     mria_config:register_callback(lb_custom_info_check, fun ?MODULE:mria_lb_custom_info_check/1),
     application:set_env(classy, setup_hooks, {?MODULE, setup_classy_hooks, []}),
     {ok, _} = application:ensure_all_started(classy, permanent),
-    logger:error("Reached the end"),
     ok.
 
 setup_classy_hooks() ->
@@ -60,13 +60,16 @@ setup_classy_hooks() ->
     classy:run_level(fun ?MODULE:on_run_level/2, 99).
 
 on_run_level(_, single) ->
+    mria:start(),
     ekka:start(),
-    %%emqx_machine_boot:ensure_apps_started(),
+    ignore = emqx_machine_boot:post_boot(),
     ok;
 on_run_level(_, stopped) ->
-    %%emqx_machine_boot:stop_apps(),
-    ekka:stop();
-on_run_level(_, _) ->
+    logger:error("entering run level stopped"),
+    emqx_machine_boot:stop_apps(),
+    ekka:stop(),
+    mria:stop();
+on_run_level(_From, _To) ->
     ok.
 
 graceful_shutdown() ->

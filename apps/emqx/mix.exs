@@ -68,8 +68,6 @@ defmodule EMQX.MixProject do
         {:emqx_durable_timer, in_umbrella: true},
         :gproc,
         :gen_rpc,
-        :ekka,
-        :classy,
         :esockd,
         :cowboy,
         :lc,

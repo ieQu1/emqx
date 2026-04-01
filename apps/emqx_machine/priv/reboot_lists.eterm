@@ -32,7 +32,7 @@
             observer,
             jq,
             gproc,
-            classy
+            {classy, load}
         ],
     %% must always be of type `load'
     common_business_apps =>
