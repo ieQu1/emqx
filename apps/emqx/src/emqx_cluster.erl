@@ -5,9 +5,9 @@
 -module(emqx_cluster).
 
 -export([
-    join/1,
-    leave/0,
-    force_leave/1,
+    join/2,
+    leave/1,
+    force_leave/2,
     ensure_normal_mode/0,
     ensure_singleton_mode/0,
 
@@ -31,11 +31,11 @@
 -define(DEFAULT_MODE, ?CLUSTER_MODE_SINGLE).
 -endif.
 
-join(Node) ->
-    classy:join_node(Node, join).
+join(Node, Intent) ->
+    classy:join_node(Node, Intent).
 
-leave() ->
-    classy:kick_node(node(), kick).
+leave(Intent) ->
+    classy:kick_node(node(), Intent).
 
 pre_join(_Cluster, _Remote, PeerNode, _Intent) ->
     check_permission(PeerNode).
@@ -46,8 +46,8 @@ post_join(_ClusterId, _Local, JoinToNode) ->
 post_leave(_ClusterId, _Local, _Intent) ->
     mria:leave().
 
-force_leave(Node) ->
-    classy:kick_node(Node, kick).
+force_leave(Node, Intent) ->
+    classy:kick_node(Node, Intent).
 
 check_permission(PeerNode) ->
     %% This call happens before clustered, so it's not possible to

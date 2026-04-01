@@ -90,8 +90,13 @@ broker(_) ->
 %%-----------------------------------------------------------------------------
 %% @doc Cluster with other nodes
 
-cluster(["join", SNode]) ->
-    case emqx_cluster:join(ekka_node:parse_name(SNode)) of
+cluster(["join" | Args]) ->
+    Intent =
+        case Args of
+            [SNode] -> join;
+            ["--force", SNode] -> force_join
+        end,
+    case emqx_cluster:join(ekka_node:parse_name(SNode), Intent) of
         ok ->
             emqx_ctl:print("Join the cluster successfully.~n"),
             %% FIXME: running status on the replicant immediately
@@ -105,12 +110,17 @@ cluster(["join", SNode]) ->
             emqx_ctl:print("Failed to join the cluster: ~0p~n", [Reason]),
             Error
     end;
-cluster(["leave"]) ->
+cluster(["leave" | Args]) ->
+    Intent =
+        case Args of
+            [] -> kick;
+            ["--force"] -> force_kick
+        end,
     Safeguards = cluster_leave_safeguards(),
     case length(Safeguards) of
         0 ->
             _ = maybe_disable_autocluster(),
-            case emqx_cluster:leave() of
+            case emqx_cluster:leave(Intent) of
                 ok ->
                     emqx_ctl:print("Leave the cluster successfully.~n"),
                     cluster(["status"]);
@@ -134,9 +144,14 @@ cluster(["leave"]) ->
             ),
             {error, Safeguards}
     end;
-cluster(["force-leave", SNode]) ->
+cluster(["force-leave" | Args]) ->
+    Intent =
+        case Args of
+            [SNode] -> kick;
+            ["--force", SNode] -> force_kick
+        end,
     Node = ekka_node:parse_name(SNode),
-    case emqx_cluster:force_leave(Node) of
+    case emqx_cluster:force_leave(Node, Intent) of
         ok ->
             case emqx_cluster_rpc:force_leave_clean(Node) of
                 ok ->
@@ -172,9 +187,9 @@ cluster(["core", "rebalance", "abort"]) ->
     emqx_ctl:print("~p~n", [Result]);
 cluster(_) ->
     emqx_ctl:usage([
-        {"cluster join <Node>", "Join the cluster"},
-        {"cluster leave", "Leave the cluster"},
-        {"cluster force-leave <Node>", "Force the node leave from cluster"},
+        {"cluster join [--force] <Node>", "Join the cluster"},
+        {"cluster leave [--force]", "Leave the cluster"},
+        {"cluster force-leave [--force] <Node>", "Force the node leave from cluster"},
         {"cluster status [--json]", "Cluster status"},
         {"cluster discovery enable", "Enable and run automatic cluster discovery (if configured)"},
         {"cluster core rebalance plan", "Plan rebalancing of replicants against cores"},
