@@ -13,7 +13,10 @@
     setup_classy_hooks/0,
     on_run_level/2,
 
-    node_status/0
+    node_status/0,
+
+    mria_join/3,
+    mria_leave/3
 ]).
 
 -export([open_ports_check/0]).
@@ -49,25 +52,36 @@ start() ->
     _ = application:load(classy),
     mria_config:register_callback(lb_custom_info, fun ?MODULE:mria_lb_custom_info/0),
     mria_config:register_callback(lb_custom_info_check, fun ?MODULE:mria_lb_custom_info_check/1),
+    %% Prepare and start classy:
+    ClassyDir = filename:join(emqx:data_dir(), "classy"),
+    ok = filelib:ensure_path(ClassyDir),
+    application:set_env(classy, table_dir, ClassyDir),
     application:set_env(classy, setup_hooks, {?MODULE, setup_classy_hooks, []}),
     {ok, _} = application:ensure_all_started(classy, permanent),
     ok.
 
 setup_classy_hooks() ->
-    %% Node init:
+    %% Node initialization:
     classy:on_node_init(fun emqx_dsch:migrate_to_classy/0, 1),
+    %% Cluster:
+    classy:pre_join(fun emqx_cluster:pre_join/4, 0),
+    classy:post_join(fun emqx_cluster:post_join/3, 99),
+    classy:post_kick(fun emqx_cluster:post_leave/3, 99),
     %% Application start:
     classy:run_level(fun ?MODULE:on_run_level/2, 99).
 
+mria_join(_ClusterId, _Local, JoinToNode) ->
+    mria:join(JoinToNode).
+
+mria_leave(_ClusterId, _Local, _Intent) ->
+    mria:leave().
+
 on_run_level(_, single) ->
     mria:start(),
-    ekka:start(),
-    ignore = emqx_machine_boot:post_boot(),
+    _ = emqx_machine_boot:post_boot(),
     ok;
 on_run_level(_, stopped) ->
-    logger:error("entering run level stopped"),
     emqx_machine_boot:stop_apps(),
-    ekka:stop(),
     mria:stop();
 on_run_level(_From, _To) ->
     ok.
