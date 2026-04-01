@@ -65,6 +65,7 @@ setup_classy_hooks() ->
     classy:on_node_init(fun emqx_dsch:migrate_to_classy/0, 1),
     %% Cluster:
     classy:pre_join(fun emqx_cluster:pre_join/4, 0),
+    classy:pre_kick(fun emqx_mgmt_api_ds:pre_kick/3, 0),
     classy:post_join(fun emqx_cluster:post_join/3, 99),
     classy:post_kick(fun emqx_cluster:post_leave/3, 99),
     %% Application start:
