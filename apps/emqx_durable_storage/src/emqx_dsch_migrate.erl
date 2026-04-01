@@ -31,8 +31,6 @@ This module migrates data from pre-6.3.0 release
 -define(replay_chunk_size, 1000).
 -endif.
 
--define(log_new, emqx_ds_dbschema_new).
--define(log_old, emqx_ds_dbschema_old).
 -define(log_current, emqx_ds_dbschema_current).
 
 -define(schema, "ds_schema").
@@ -94,10 +92,10 @@ random site ID.
 """.
 -spec restore() -> pstate() | ?empty_schema.
 restore() ->
-    ok = compress_and_migrate_pstate(1),
     File = schema_file(),
     case filelib:is_file(File) of
         true ->
+            %% FIXME: close log
             case open_log(read_write, ?log_current, File) of
                 ok ->
                     restore_from_wal(?log_current);
@@ -131,68 +129,6 @@ WAL should be opened using `disk_log:open(...)`.
 -spec restore_from_wal(wal()) -> pstate() | ?empty_schema.
 restore_from_wal(Log) ->
     replay_wal(Log, ?empty_schema, start).
-
--spec compress_and_migrate_pstate(Attempt) -> ok when
-    Attempt :: pos_integer().
-compress_and_migrate_pstate(Attempt) when Attempt < 3 ->
-    %% Compressed and migrated schema will be dumped to a temporary
-    %% log. Once everything's complete, it will replace the current
-    %% schema dump:
-    New = schema_file() ++ ".NEW",
-    HasCurrent = filelib:is_file(schema_file()),
-    HasNew = filelib:is_file(New),
-    case {HasCurrent, HasNew} of
-        {false, false} ->
-            %% This is a new deployment:
-            ok;
-        {true, false} ->
-            %% Normal situation:
-            ok = open_log(read_only, ?log_old, schema_file()),
-            ok = open_log(read_write, ?log_new, New),
-            Pstate = restore_from_wal(?log_old),
-            case dump(Pstate, ?log_new) of
-                ok ->
-                    ok = disk_log:close(?log_old),
-                    ok = disk_log:close(?log_new),
-                    %% At this point we are certain that .NEW log has
-                    %% complete data. Old log can be discarded:
-                    file:rename(New, schema_file());
-                Wrong ->
-                    ?tp(
-                        critical,
-                        "Failed to read or migrate old durable storage schema",
-                        #{
-                            old_schema => Pstate,
-                            result => Wrong
-                        }
-                    ),
-                    %% Migration went wrong.
-                    _ = disk_log:close(?log_old),
-                    _ = disk_log:close(?log_new),
-                    exit(failed_to_migrate_schema)
-            end;
-        {true, true} ->
-            %% There's a NEW log from the previous migration attempt
-            %% that was aborted. Discard the it (since it may be
-            %% incomplete or otherwise broken) and migrate again:
-            ?tp(debug, emqx_dsch_discard_new_schema, #{file => New}),
-            ok = file:rename(New, file_backup(New)),
-            compress_and_migrate_pstate(Attempt + 1);
-        {false, true} ->
-            %% This shouldn't really happen (rename failed?). But make NEW log current
-            %% and attempt again (back it up first):
-            Bak = file_backup(New),
-            _ = file:copy(New, Bak),
-            ?tp(warning, "Restoring schema from NEW file", #{file => New, backup => Bak}),
-            ok = file:rename(New, schema_file()),
-            compress_and_migrate_pstate(Attempt + 1)
-    end;
-compress_and_migrate_pstate(Attempt) ->
-    %% Prevent infinite loop and fail:
-    ?tp(critical, "Too many attempts to migrate durable storage schema. Exiting.", #{
-        attempts => Attempt
-    }),
-    exit(failed_to_migrate_schema).
 
 -spec pure_mutate_l([schema_op()], pstate() | ?empty_schema) ->
     {ok, pstate() | ?empty_schema} | {error, _}.
@@ -229,33 +165,6 @@ replay_wal(Log, Schema0, Cont0) ->
             end;
         eof ->
             Schema0
-    end.
-
--doc """
-A safe way to permanently change the schema.
-
-This function does it in three steps:
-
-1. Verify that sequence of commands is valid.
-2. Append the commands to the WAL.
-3. Return the mutated schema.
-""".
--spec safe_add_l(wal(), [schema_op()], pstate() | ?empty_schema) ->
-    {ok, pstate() | ?empty_schema} | {error, _}.
-safe_add_l(WAL, Commands, Pstate0) ->
-    try pure_mutate_l(Commands, Pstate0) of
-        {ok, Pstate = #{ver := _, schema := #{site := _}}} ->
-            ok = disk_log:log_terms(WAL, Commands),
-            ok = disk_log:sync(WAL),
-            {ok, Pstate};
-        {error, _} = Err ->
-            Err
-    catch
-        EC:Err:Stack ->
-            ?tp(warning, ds_schema_command_crash, #{
-                EC => Err, stacktrace => Stack, commands => Commands, s => Pstate0
-            }),
-            {error, unknown}
     end.
 
 -doc """
@@ -349,51 +258,6 @@ open_log(Mode, Name, File) ->
         Other ->
             Other
     end.
-
--spec file_backup(file:filename()) -> file:filename().
-file_backup(Filename) ->
-    binary_to_list(
-        iolist_to_binary(
-            io_lib:format("~s.BAK.~p", [Filename, os:system_time(millisecond)])
-        )
-    ).
-
--doc """
-Dump schema to a WAL.
-The WAL should be open; all data previously stored there is discarded.
-""".
--spec dump(pstate(), wal()) -> ok | {error, _}.
-dump(Pstate, WAL) ->
-    ok = disk_log:truncate(WAL),
-    #{ver := Ver, schema := Schema, pending_ctr := PendingCtr, pending := Pending} = Pstate,
-    #{site := Site, cluster := Cluster, dbs := DBs, peers := Peers} = Schema,
-    Ops =
-        [
-            #sop_init{ver = Ver, id = Site, next_pending_id = PendingCtr},
-            #sop_set_cluster{cluster = Cluster}
-        ] ++
-            [#sop_set_db{db = DB, schema = DBSchema} || {DB, DBSchema} <- maps:to_list(DBs)] ++
-            [
-                #sop_set_peer{peer = Peer, state = PeerState}
-             || {Peer, PeerState} <- maps:to_list(Peers)
-            ] ++
-            dump_pending(Pending),
-    case safe_add_l(WAL, Ops, ?empty_schema) of
-        {ok, _} ->
-            ok;
-        {error, _} = Err ->
-            Err
-    end.
-
--spec dump_pending(#{emqx_dsch:pending_id() => emqx_dsch:pending()}) -> [emqx_dsch:schema_op()].
-dump_pending(Pending) ->
-    maps:fold(
-        fun(Id, Val, Acc) ->
-            [#sop_add_pending{id = Id, p = Val} | Acc]
-        end,
-        [],
-        Pending
-    ).
 
 -spec new_empty_pstate(1, emqx_dsch:site(), emqx_dsch:pending_id()) -> pstate().
 new_empty_pstate(Ver, Site, PendingCtr) ->

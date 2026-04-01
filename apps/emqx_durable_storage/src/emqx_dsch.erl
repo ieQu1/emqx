@@ -130,14 +130,8 @@ If cluster ID wasn't previously created, it is initialized from
     migrate_to_classy/0,
 
     start_link/0,
-    schema_file/0,
-    restore_from_wal/1,
-    dump/2,
 
     %% Low-level cluster API:
-    set_cluster/1,
-    set_peer/2,
-    delete_peer/1,
 
     start_link_pending/2,
     pending_task_entrypoint/2
@@ -398,40 +392,6 @@ get_site_schema(Node, Timeout) when is_atom(Node) ->
             %% TODO: better error reason
             {error, Other}
     end.
-
--doc """
-Update cluster ID.
-
-Setting cluster to a special value `singleton` prevents peers from
-joining.
-
-Cluster ID isn't used by this module directly, but it's stored in the
-schema anyway, because most backends likely want to make sure that
-they share data and communicate only with the nodes that belong to the
-same cluster.
-
-Cluster cannot be set to `singleton` when there are peers, they should
-be removed first.
-""".
--spec set_cluster(cluster() | singleton) -> ok | {error, badarg}.
-set_cluster(Cluster) when is_binary(Cluster); Cluster =:= singleton ->
-    gen_server:call(?SERVER, #sop_set_cluster{cluster = Cluster});
-set_cluster(_) ->
-    {error, badarg}.
-
--doc """
-Unconditionally add peer site to the cluster.
-
-WARNING: This function doesn't check if the peer belongs to the same
-cluster and therefore it's unsafe for general use.
-""".
--spec set_peer(site(), peer_state()) -> ok | {error, _}.
-set_peer(Site, State) when is_binary(Site), is_atom(State) ->
-    gen_server:call(?SERVER, #sop_set_peer{peer = Site, state = State}).
-
--spec delete_peer(site()) -> ok | {error, _}.
-delete_peer(Site) when is_binary(Site) ->
-    gen_server:call(?SERVER, #sop_delete_peer{peer = Site}).
 
 -spec get_db_schema(emqx_ds:db()) -> db_schema() | undefined.
 get_db_schema(DB) ->
