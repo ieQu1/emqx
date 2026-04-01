@@ -79,22 +79,6 @@ and it's designed to stay dormant until some backend requests uses it.
 It's activated using `need_cluster(Nnodes)` API.
 If cluster ID wasn't previously created, it is initialized from
 `emqx_durable_storage.cluster_id` application environment variable.
-
-## Implementation
-
-OTP's `disk_log` is used as the persistence mechanism.
-Contents of the schema are mirrored in a persistent term.
-This makes scheama very cheap to read and hard to update.
-So don't update it often.
-
-All operations that mutate the scheama are synchronously written to
-the WAL. For simplicity, WAL is not truncated or compressed while the
-application is running. It is happens when the server starts.
-
-When the server starts, it first completely replays the WAL to get to
-the latest schema state, then this state is potentially migrated, and
-dumped to another WAL. The latter is read again to initialize the
-server state.
 """.
 
 -behaviour(gen_server).
@@ -230,53 +214,9 @@ operations and other metadata.
     dbs := #{emqx_ds:db() => db_schema()}
 }.
 
--doc """
-Persistent state of the node including some private data.
-""".
--type pstate() :: #{
-    ver := 1,
-    pending_ctr := pending_id(),
-    pending := #{pending_id() => pending()},
-    schema := schema()
-}.
-
-%% Schema operations:
-%%    Create a new site and schema:
--record(sop_init, {ver = 1 :: 1, id :: site(), next_pending_id :: pending_id()}).
-%%%   Operation with the cluster
--record(sop_set_cluster, {cluster :: cluster() | singleton}).
--record(sop_set_peer, {peer :: site(), state :: peer_state()}).
--record(sop_delete_peer, {peer :: site()}).
-%%    Set DB schema:
--record(sop_set_db, {db :: emqx_ds:db(), schema :: db_schema()}).
--record(sop_drop_db, {db :: emqx_ds:db()}).
-%%    Pending actions:
--record(sop_add_pending, {id = new :: pending_id() | new, p :: pending()}).
--record(sop_del_pending, {id :: pending_id()}).
-
--doc """
-A type of WAL entries.
-""".
--type schema_op() ::
-    #sop_init{}
-    | #sop_set_cluster{}
-    | #sop_set_db{}
-    | #sop_drop_db{}
-    | #sop_set_peer{}
-    | #sop_delete_peer{}
-    | #sop_add_pending{}
-    | #sop_del_pending{}.
-
 %%--------------------------------------------------------------------------------
 %% Server state and misc. types
 %%--------------------------------------------------------------------------------
-
--define(schema, "ds_schema").
-
--doc """
-Name of the disk log, as in `disk_log:open([{name, Name}, ...])`
-""".
--type wal() :: term().
 
 -type dbshard() :: {emqx_ds:db(), emqx_ds:shard()}.
 
@@ -290,10 +230,6 @@ Name of the disk log, as in `disk_log:open([{name, Name}, ...])`
     gvars := ets:tid(),
     runtime := db_runtime_config()
 }.
-
--define(log_new, emqx_ds_dbschema_new).
--define(log_old, emqx_ds_dbschema_old).
--define(log_current, emqx_ds_dbschema_current).
 
 %% Calls:
 -record(call_register_backend, {alias :: atom(), cbm :: module()}).
@@ -341,12 +277,6 @@ Backends should re-register themselves on restart of DS application.
     pending = #{} :: #{pending_id() => pid()}
 }).
 -type s() :: #s{}.
-
--ifdef(TEST).
--define(replay_chunk_size, 2).
--else.
--define(replay_chunk_size, 1000).
--endif.
 
 -type human_readable() :: string().
 
@@ -688,50 +618,6 @@ pending_task_entrypoint(Id, TaskDefn) ->
             end
     end.
 
--doc """
-Re-create the schema state by reading the WAL.
-
-WAL should be opened using `disk_log:open(...)`.
-""".
--spec restore_from_wal(wal()) -> pstate() | ?empty_schema.
-restore_from_wal(Log) ->
-    replay_wal(Log, ?empty_schema, start).
-
--doc """
-Return location of the node's schema file.
-(For debugging and troubleshooting).
-""".
--spec schema_file() -> file:filename().
-schema_file() ->
-    filename:join(emqx_ds_storage_layer:base_dir(), ?schema).
-
--doc """
-Dump schema to a WAL.
-The WAL should be open; all data previously stored there is discarded.
-""".
--spec dump(pstate(), wal()) -> ok | {error, _}.
-dump(Pstate, WAL) ->
-    ok = disk_log:truncate(WAL),
-    #{ver := Ver, schema := Schema, pending_ctr := PendingCtr, pending := Pending} = Pstate,
-    #{site := Site, cluster := Cluster, dbs := DBs, peers := Peers} = Schema,
-    Ops =
-        [
-            #sop_init{ver = Ver, id = Site, next_pending_id = PendingCtr},
-            #sop_set_cluster{cluster = Cluster}
-        ] ++
-            [#sop_set_db{db = DB, schema = DBSchema} || {DB, DBSchema} <- maps:to_list(DBs)] ++
-            [
-                #sop_set_peer{peer = Peer, state = PeerState}
-             || {Peer, PeerState} <- maps:to_list(Peers)
-            ] ++
-            dump_pending(Pending),
-    case safe_add_l(WAL, Ops, ?empty_schema) of
-        {ok, _} ->
-            ok;
-        {error, _} = Err ->
-            Err
-    end.
-
 %%================================================================================
 %% behavior callbacks
 %%================================================================================
@@ -830,9 +716,6 @@ terminate(Reason, S0 = #s{dbs = DBs}) ->
 terminate(_Reason, undefined) ->
     persistent_term:erase(?dsch_pt_schema),
     persistent_term:erase(?dsch_pt_backends),
-    _ = disk_log:close(?log_current),
-    _ = disk_log:close(?log_new),
-    _ = disk_log:close(?log_old),
     ok.
 
 %%================================================================================
@@ -934,16 +817,6 @@ do_add_pending(Scope, Command, Data, S0) ->
         self() ! #dispatch_pending{scope = Scope},
         modify_schema([#sop_add_pending{id = new, p = Wrapper}], S0)
     end.
-
--spec dump_pending(#{pending_id() => pending()}) -> [schema_op()].
-dump_pending(Pending) ->
-    maps:fold(
-        fun(Id, Val, Acc) ->
-            [#sop_add_pending{id = Id, p = Val} | Acc]
-        end,
-        [],
-        Pending
-    ).
 
 verify_pending(site, Command, Data) when is_atom(Command), is_map(Data) ->
     case Command of
@@ -1152,152 +1025,6 @@ modify_schema(Ops, S = #s{sch = Pstate0}) ->
         {ok, S#s{sch = Pstate}}
     end.
 
--doc """
-Open `current` log and apply all entries contained there to the empty
-state, thus re-creating the state before shutdown of the node.
-
-If the log is empty, then initialize the schema by creating a new
-random site ID.
-""".
--spec restore_or_init_pstate() -> pstate().
-restore_or_init_pstate() ->
-    ok = compress_and_migrate_pstate(1),
-    File = schema_file(),
-    _ = filelib:ensure_dir(File),
-    case open_log(read_write, ?log_current, File) of
-        ok ->
-            ensure_site_schema(restore_from_wal(?log_current));
-        {error, Reason} ->
-            ?tp(critical, "Failed to read durable storage schema", #{
-                reason => Reason, file => File
-            }),
-            exit(badschema)
-    end.
-
--doc """
-A pure function that mutates the state record accoring to a command.
-
-Note: this function has to maintain backward-compatibility.
-""".
--spec pure_mutate(schema_op(), pstate() | ?empty_schema) ->
-    {ok, pstate() | ?empty_schema} | {error, _}.
-pure_mutate(Command, ?empty_schema) ->
-    %% Only one command is allowed in the empty state:
-    case Command of
-        #sop_init{ver = Ver, id = Site, next_pending_id = PendingCtr} ->
-            {ok, new_empty_pstate(Ver, Site, PendingCtr)};
-        _ ->
-            {error, site_schema_is_not_initialized}
-    end;
-pure_mutate(#sop_set_db{db = DB, schema = DBSchema}, S) ->
-    with_schema(
-        dbs,
-        S,
-        fun(DBs) ->
-            DBs#{DB => DBSchema}
-        end
-    );
-pure_mutate(#sop_drop_db{db = DB}, S) ->
-    with_schema(
-        dbs,
-        S,
-        fun(DBs) ->
-            maps:remove(DB, DBs)
-        end
-    );
-pure_mutate(#sop_set_cluster{cluster = Cluster}, S) ->
-    with_schema(
-        cluster,
-        S,
-        fun(_) ->
-            Cluster
-        end
-    );
-pure_mutate(#sop_set_peer{peer = Site, state = State}, S) ->
-    with_schema(
-        peers,
-        S,
-        fun(Peers) ->
-            Peers#{Site => State}
-        end
-    );
-pure_mutate(#sop_delete_peer{peer = Site}, S) ->
-    with_schema(
-        peers,
-        S,
-        fun(Peers) ->
-            maps:remove(Site, Peers)
-        end
-    );
-pure_mutate(
-    #sop_add_pending{id = MaybeId, p = Pending}, S0 = #{pending := Pend0, pending_ctr := NextId}
-) ->
-    case MaybeId of
-        new ->
-            Id = NextId,
-            S1 = S0#{pending_ctr := NextId + 1};
-        Id ->
-            S1 = S0
-    end,
-    S = S1#{pending := Pend0#{Id => Pending}},
-    {ok, S};
-pure_mutate(#sop_del_pending{id = Id}, S0 = #{pending := Pend0}) ->
-    S = S0#{pending := maps:remove(Id, Pend0)},
-    {ok, S};
-pure_mutate(Cmd, _S) ->
-    {error, {unknown_comand, Cmd}}.
-
--spec with_schema(atom(), pstate(), Fun) -> {ok, pstate()} | {error, Err} when
-    Fun :: fun((A) -> {ok, A} | {error, Err}).
-with_schema(Key, Pstate = #{schema := Schema}, Fun) ->
-    #{Key := Val0} = Schema,
-    Val = Fun(Val0),
-    {ok, Pstate#{schema := Schema#{Key := Val}}}.
-
--spec new_empty_pstate(1, site(), pending_id()) -> pstate().
-new_empty_pstate(Ver, Site, PendingCtr) ->
-    #{
-        ver => Ver,
-        pending_ctr => PendingCtr,
-        pending => #{},
-        schema => #{
-            site => Site,
-            cluster => singleton,
-            peers => #{},
-            dbs => #{}
-        }
-    }.
-
--spec pure_mutate_l([schema_op()], pstate() | ?empty_schema) ->
-    {ok, pstate() | ?empty_schema} | {error, _}.
-pure_mutate_l([], S) ->
-    {ok, S};
-pure_mutate_l([Command | L], S0) ->
-    case pure_mutate(Command, S0) of
-        {ok, S} -> pure_mutate_l(L, S);
-        {error, _} = Err -> Err
-    end.
-
--spec replay_wal(wal(), pstate() | ?empty_schema, disk_log:continuation() | start) ->
-    pstate() | ?empty_schema.
-replay_wal(Log, Schema0, Cont0) ->
-    case disk_log:chunk(Log, Cont0, ?replay_chunk_size) of
-        {Cont, Cmds} ->
-            case pure_mutate_l(Cmds, Schema0) of
-                {ok, Schema} ->
-                    replay_wal(Log, Schema, Cont);
-                {error, Err} ->
-                    ?tp(
-                        critical,
-                        "Failed to restore schema. Database schema has been created by a later version of EMQX?",
-                        #{error => Err}
-                    ),
-                    exit(cannot_process_schema_command)
-            end;
-        eof ->
-            Schema0
-    end.
-
 -spec ensure_site_schema(pstate() | ?empty_schema) -> pstate().
 ensure_site_schema(?empty_schema) ->
     Site = binary:encode_hex(crypto:strong_rand_bytes(8)),
@@ -1307,33 +1034,6 @@ ensure_site_schema(?empty_schema) ->
     Pstate;
 ensure_site_schema(Pstate = #{ver := _}) ->
     Pstate.
-
--doc """
-A safe way to permanently change the schema.
-
-This function does it in three steps:
-
-1. Verify that sequence of commands is valid.
-2. Append the commands to the WAL.
-3. Return the mutated schema.
-""".
--spec safe_add_l(wal(), [schema_op()], pstate() | ?empty_schema) ->
-    {ok, pstate() | ?empty_schema} | {error, _}.
-safe_add_l(WAL, Commands, Pstate0) ->
-    try pure_mutate_l(Commands, Pstate0) of
-        {ok, Pstate = #{ver := _, schema := #{site := _}}} ->
-            ok = disk_log:log_terms(WAL, Commands),
-            ok = disk_log:sync(WAL),
-            {ok, Pstate};
-        {error, _} = Err ->
-            Err
-    catch
-        EC:Err:Stack ->
-            ?tp(warning, ds_schema_command_crash, #{
-                EC => Err, stacktrace => Stack, commands => Commands, s => Pstate0
-            }),
-            {error, unknown}
-    end.
 
 -spec set_db_runtime(emqx_ds:db(), module(), ets:tid(), db_runtime_config()) -> ok.
 set_db_runtime(DB, CBM, GVars, RuntimeConf) ->
@@ -1369,95 +1069,6 @@ lookup_backend_cbm(Backend, #s{backends = Backends}) ->
             {error, {no_such_backend, Backend}}
     end.
 
--spec compress_and_migrate_pstate(Attempt) -> ok when
-    Attempt :: pos_integer().
-compress_and_migrate_pstate(Attempt) when Attempt < 3 ->
-    %% Compressed and migrated schema will be dumped to a temporary
-    %% log. Once everything's complete, it will replace the current
-    %% schema dump:
-    New = schema_file() ++ ".NEW",
-    HasCurrent = filelib:is_file(schema_file()),
-    HasNew = filelib:is_file(New),
-    case {HasCurrent, HasNew} of
-        {false, false} ->
-            %% This is a new deployment:
-            ok;
-        {true, false} ->
-            %% Normal situation:
-            ok = open_log(read_only, ?log_old, schema_file()),
-            ok = open_log(read_write, ?log_new, New),
-            Pstate = perform_migration(restore_from_wal(?log_old)),
-            case dump(Pstate, ?log_new) of
-                ok ->
-                    ok = disk_log:close(?log_old),
-                    ok = disk_log:close(?log_new),
-                    %% At this point we are certain that .NEW log has
-                    %% complete data. Old log can be discarded:
-                    file:rename(New, schema_file());
-                Wrong ->
-                    ?tp(
-                        critical,
-                        "Failed to read or migrate old durable storage schema",
-                        #{
-                            old_schema => Pstate,
-                            result => Wrong
-                        }
-                    ),
-                    %% Migration went wrong.
-                    _ = disk_log:close(?log_old),
-                    _ = disk_log:close(?log_new),
-                    exit(failed_to_migrate_schema)
-            end;
-        {true, true} ->
-            %% There's a NEW log from the previous migration attempt
-            %% that was aborted. Discard the it (since it may be
-            %% incomplete or otherwise broken) and migrate again:
-            ?tp(debug, emqx_dsch_discard_new_schema, #{file => New}),
-            ok = file:rename(New, file_backup(New)),
-            compress_and_migrate_pstate(Attempt + 1);
-        {false, true} ->
-            %% This shouldn't really happen (rename failed?). But make NEW log current
-            %% and attempt again (back it up first):
-            Bak = file_backup(New),
-            _ = file:copy(New, Bak),
-            ?tp(warning, "Restoring schema from NEW file", #{file => New, backup => Bak}),
-            ok = file:rename(New, schema_file()),
-            compress_and_migrate_pstate(Attempt + 1)
-    end;
-compress_and_migrate_pstate(Attempt) ->
-    %% Prevent infinite loop and fail:
-    ?tp(critical, "Too many attempts to migrate durable storage schema. Exiting.", #{
-        attempts => Attempt
-    }),
-    exit(failed_to_migrate_schema).
-
 -spec perform_migration(#{ver := pos_integer(), _ => _}) -> pstate().
 perform_migration(Pstate = #{ver := 1}) ->
     Pstate.
-
-open_log(Mode, Name, File) ->
-    case
-        disk_log:open([
-            {mode, Mode},
-            {name, Name},
-            {file, File},
-            {repair, true},
-            {type, halt}
-        ])
-    of
-        {ok, _} ->
-            ok;
-        {repaired, _, _, _} = Result ->
-            ?tp(warning, "Durable storage schema repaired", #{result => Result, file => File}),
-            ok;
-        Other ->
-            Other
-    end.
-
--spec file_backup(file:filename()) -> file:filename().
-file_backup(Filename) ->
-    binary_to_list(
-        iolist_to_binary(
-            io_lib:format("~s.BAK.~p", [Filename, os:system_time(millisecond)])
-        )
-    ).
