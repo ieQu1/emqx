@@ -49,13 +49,23 @@ start() ->
     mria_config:register_callback(lb_custom_info, fun ?MODULE:mria_lb_custom_info/0),
     mria_config:register_callback(lb_custom_info_check, fun ?MODULE:mria_lb_custom_info_check/1),
     application:set_env(classy, setup_hooks, {?MODULE, setup_classy_hooks, []}),
-    {ok, _} = application:ensure_all_started(classy),
-    ekka:start(),
+    {ok, _} = application:ensure_all_started(classy, permanent),
+    logger:error("Reached the end"),
     ok.
 
 setup_classy_hooks() ->
-    classy:run_level(fun ?MODULE:on_run_level/1, 0).
+    %% Node init:
+    classy:on_node_init(fun emqx_dsch:migrate_to_classy/0, 1),
+    %% Application start:
+    classy:run_level(fun ?MODULE:on_run_level/2, 99).
 
+on_run_level(_, single) ->
+    ekka:start(),
+    %%emqx_machine_boot:ensure_apps_started(),
+    ok;
+on_run_level(_, stopped) ->
+    %%emqx_machine_boot:stop_apps(),
+    ekka:stop();
 on_run_level(_, _) ->
     ok.
 

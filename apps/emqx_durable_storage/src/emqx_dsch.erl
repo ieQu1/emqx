@@ -143,6 +143,8 @@ server state.
 
 %% internal exports:
 -export([
+    migrate_to_classy/0,
+
     start_link/0,
     schema_file/0,
     restore_from_wal/1,
@@ -657,6 +659,11 @@ gvar_unset_all(DB, Shard, Scope) ->
 %%================================================================================
 %% Internal exports
 %%================================================================================
+
+-spec migrate_to_classy() -> ok.
+migrate_to_classy() ->
+    ?tp(warning, "Migrating data to classy", #{}),
+    ok.
 
 -spec start_link() -> {ok, pid()}.
 start_link() ->
