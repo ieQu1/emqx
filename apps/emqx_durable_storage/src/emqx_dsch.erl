@@ -151,7 +151,6 @@ If cluster ID wasn't previously created, it is initialized from
     pending_scope/0,
     pending/0,
 
-    wal/0,
     dbshard/0,
     human_readable/0
 ]).
@@ -212,6 +211,9 @@ operations and other metadata.
 %% Server state and misc. types
 %%--------------------------------------------------------------------------------
 
+-define(ptab_schema, emqx_dsch_schema_tab).
+-define(ptab_pending, emqx_dsch_pending_tab).
+
 -type dbshard() :: {emqx_ds:db(), emqx_ds:shard()}.
 
 -type db_runtime_config() :: #{
@@ -234,6 +236,7 @@ operations and other metadata.
 -record(call_list_pending, {scope :: pending_scope() | all}).
 -record(call_open_db, {db :: emqx_ds:db(), conf :: db_runtime_config()}).
 -record(call_close_db, {db :: emqx_ds:db()}).
+-record(call_drop_db, {db :: emqx_ds:db()}).
 -record(call_update_db_schema, {
     db :: emqx_ds:db(), backend :: emqx_ds:backend(), schema :: db_schema()
 }).
@@ -262,13 +265,10 @@ Backends should re-register themselves on restart of DS application.
 
 -doc "Server's internal state.".
 -record(s, {
-    sch :: pstate(),
     %% Backend registrations:
     backends = #{} :: #{atom() => bs()},
     %% Transient DB and shard configuration:
-    dbs = #{} :: #{emqx_ds:db() => dbs()},
-    %% Tracking of pending tasks:
-    pending = #{} :: #{pending_id() => pid()}
+    open_dbs = #{} :: #{emqx_ds:db() => dbs()}
 }).
 -type s() :: #s{}.
 
@@ -346,17 +346,11 @@ via cluster change event.
 
 -spec this_site() -> binary().
 this_site() ->
-    #{site := Site} = get_site_schema(),
-    Site.
+    classy_node:the_site().
 
--spec whereis_site(site()) -> node() | undefined.
+-spec whereis_site(site()) -> {ok, node()} | undefined.
 whereis_site(Site) ->
-    case global:whereis_name(?global_name(Site)) of
-        undefined ->
-            undefined;
-        Pid ->
-            node(Pid)
-    end.
+    classy:node_of_site(Site, false).
 
 -doc """
 Get the entire schema of the site.
@@ -422,22 +416,22 @@ Add a pending action.
 -spec add_pending(pending_scope(), Command, Data) -> ok | {error, _} when
     Command :: atom(), Data :: #{atom() => _}.
 add_pending(Scope, Command, Data) ->
-    gen_server:call(?SERVER, #call_add_pending{scope = Scope, cmd = Command, data = Data}).
+    error(todo).
 
 -spec list_pending() -> #{pending_id() => pending()}.
 list_pending() ->
-    list_pending(all).
+    error(todo).
 
 -spec list_pending(pending_scope() | all) -> #{pending_id() => pending()}.
 list_pending(Scope) ->
-    gen_server:call(?SERVER, #call_list_pending{scope = Scope}).
+    error(todo).
 
 -doc """
 Delete pending operation with the given ID.
 """.
 -spec del_pending(pending_id()) -> ok.
 del_pending(Id) ->
-    gen_server:call(?SERVER, #sop_del_pending{id = Id}).
+    error(todo).
 
 -doc """
 If database schema wasn't present before, create schema it (equal to the
@@ -464,7 +458,7 @@ update_db_schema(DB, NewSchema = #{backend := Backend}) when is_atom(Backend) ->
 
 -spec drop_db_schema(emqx_ds:db()) -> ok | {error, _}.
 drop_db_schema(DB) ->
-    gen_server:call(?SERVER, #sop_drop_db{db = DB}).
+    gen_server:call(?SERVER, #call_drop_db{db = DB}).
 
 -spec open_db(emqx_ds:db(), db_runtime_config()) -> ok | {error, _}.
 open_db(DB, RuntimeConfig) ->
@@ -584,11 +578,9 @@ pending_task_entrypoint(Id, TaskDefn) ->
 
 init(_) ->
     process_flag(trap_exit, true),
-    Pstate = #{} = restore_or_init_pstate(),
-    persistent_term:put(?dsch_pt_schema, maps:get(schema, Pstate)),
-    S = #s{sch = Pstate},
-    #{schema := #{site := Site}} = Pstate,
-    global:register_name(?global_name(Site), self(), fun global:random_notify_name/3),
+    ok = classy_table:open(?ptab_schema, #{}),
+    ok = classy_table:open(?ptab_pending, #{}),
+    S = #s{},
     {ok, S}.
 
 handle_call(#call_open_db{db = DB, conf = RuntimeConf}, _From, S0) ->
@@ -607,30 +599,10 @@ handle_call(#call_ensure_db_schema{db = DB, backend = Backend, schema = NewDBSch
     do_ensure_db_schema(DB, Backend, NewDBSchema, S);
 handle_call(#call_update_db_schema{db = DB, backend = NewBackend, schema = NewSchema}, _From, S) ->
     do_update_db_schema(DB, NewBackend, NewSchema, S);
-handle_call(#sop_drop_db{db = DB}, _From, S) ->
+handle_call(#call_drop_db{db = DB}, _From, S) ->
     do_drop_db(DB, S);
 handle_call(#call_register_backend{alias = Alias, cbm = CBM}, _From, S) ->
     do_register_backend(Alias, CBM, S);
-handle_call(#call_add_pending{scope = Scope, cmd = Command, data = Data}, _From, S0) ->
-    case do_add_pending(Scope, Command, Data, S0) of
-        {ok, S} -> {reply, ok, S};
-        {error, _} = Err -> {reply, Err, S0}
-    end;
-handle_call(#call_list_pending{scope = Scope}, _From, S) ->
-    {reply, do_list_pending(Scope, S), S};
-handle_call(#sop_del_pending{id = Id}, _From, S) ->
-    {reply, ok, do_del_pending(Id, S)};
-handle_call(SchemaOp, _From, S0) when
-    is_record(SchemaOp, sop_set_peer);
-    is_record(SchemaOp, sop_delete_peer);
-    is_record(SchemaOp, sop_set_cluster)
-->
-    case do_update_cluster(SchemaOp, S0) of
-        {ok, S} ->
-            {reply, ok, S};
-        {error, _} = Err ->
-            {reply, Err, S0}
-    end;
 handle_call(Call, From, S) ->
     ?tp(error, emqx_dsch_unkown_call, #{from => From, call => Call, state => S}),
     {reply, {error, unknown_call}, S}.
@@ -639,19 +611,6 @@ handle_cast(Cast, S) ->
     ?tp(error, emqx_dsch_unkown_cast, #{call => Cast, state => S}),
     {noreply, S}.
 
-handle_info(#dispatch_pending{scope = Scope}, S0) ->
-    S = do_dispatch_db_pending(Scope, S0),
-    {noreply, S};
-handle_info({global_name_conflict, ?global_name(Site)}, S = #s{sch = Pstate}) ->
-    #{schema := #{site := MySite}} = Pstate,
-    case Site =:= MySite of
-        true ->
-            Expl = "Another node claimed site ID. All sites must be unique",
-            ?tp(error, global_site_conflict, #{site => Site, exlanation => Expl}),
-            {stop, site_conflict, S};
-        false ->
-            {noreply, S}
-    end;
 handle_info({'EXIT', From, Reason}, S) ->
     case Reason of
         normal ->
@@ -663,7 +622,7 @@ handle_info({'EXIT', From, Reason}, S) ->
 handle_info(_Info, S) ->
     {noreply, S}.
 
-terminate(Reason, S0 = #s{dbs = DBs}) ->
+terminate(Reason, S0 = #s{open_dbs = DBs}) ->
     %% Close all DBs:
     _ = maps:fold(
         fun(DB, _, S) ->
@@ -676,6 +635,8 @@ terminate(Reason, S0 = #s{dbs = DBs}) ->
 terminate(_Reason, undefined) ->
     persistent_term:erase(?dsch_pt_schema),
     persistent_term:erase(?dsch_pt_backends),
+    classy_table:close(?ptab_schema),
+    classy_table:close(?ptab_pending),
     ok.
 
 %%================================================================================
@@ -683,7 +644,7 @@ terminate(_Reason, undefined) ->
 %%================================================================================
 
 -spec do_open_db(emqx_ds:db(), db_runtime_config(), s()) -> {ok, s()} | {error, _}.
-do_open_db(DB, RuntimeConf, S0 = #s{dbs = DBs}) ->
+do_open_db(DB, RuntimeConf, S0 = #s{open_dbs = DBs}) ->
     maybe
         false ?= maps:is_key(DB, DBs) andalso
             {error, already_open},
@@ -694,7 +655,7 @@ do_open_db(DB, RuntimeConf, S0 = #s{dbs = DBs}) ->
             set, public, {read_concurrency, true}, {write_concurrency, false}
         ]),
         S = S0#s{
-            dbs = DBs#{
+            open_dbs = DBs#{
                 DB => #dbs{rtconf = RuntimeConf, gvars = GVars}
             }
         },
@@ -704,7 +665,7 @@ do_open_db(DB, RuntimeConf, S0 = #s{dbs = DBs}) ->
     end.
 
 -spec do_update_db_config(emqx_ds:db(), db_runtime_config(), s()) -> {ok, s()} | {error, _}.
-do_update_db_config(DB, NewConf, S0 = #s{dbs = DBs}) ->
+do_update_db_config(DB, NewConf, S0 = #s{open_dbs = DBs}) ->
     maybe
         #{DB := DBstate0 = #dbs{gvars = GVars}} ?= DBs,
         {ok, DBSchema} ?= lookup_db_schema(DB, S0),
@@ -712,7 +673,7 @@ do_update_db_config(DB, NewConf, S0 = #s{dbs = DBs}) ->
         {ok, CBM} ?= lookup_backend_cbm(Backend, S0),
         DBstate = DBstate0#dbs{rtconf = NewConf},
         S = S0#s{
-            dbs = DBs#{DB := DBstate}
+            open_dbs = DBs#{DB := DBstate}
         },
         set_db_runtime(DB, CBM, GVars, NewConf),
         %% Notify backend:
@@ -733,14 +694,14 @@ do_update_db_config(DB, NewConf, S0 = #s{dbs = DBs}) ->
     end.
 
 -spec do_close_db(emqx_ds:db(), s()) -> s().
-do_close_db(DB, S0 = #s{dbs = DBs}) ->
+do_close_db(DB, S0 = #s{open_dbs = DBs}) ->
     S = shutdown_db_pending(DB, S0),
     case DBs of
         #{DB := #dbs{gvars = GVars}} ->
             erase_db_consts(DB),
             ets:delete(GVars),
             S#s{
-                dbs = maps:remove(DB, DBs)
+                open_dbs = maps:remove(DB, DBs)
             };
         #{} ->
             S
@@ -763,94 +724,22 @@ do_register_backend(Alias, CBM, S = #s{backends = Backends0}) ->
 set_backend_cbms_pt(Backends) ->
     persistent_term:put(?dsch_pt_backends, Backends).
 
-do_list_pending(Scope, #s{sch = #{pending := Pending}}) ->
-    maps:filter(
-        fun(_Id, #{scope := Sc}) ->
-            Scope =:= all orelse Sc =:= Scope
-        end,
-        Pending
-    ).
-
-do_add_pending(Scope, Command, Data, S0) ->
-    maybe
-        {ok, Wrapper} ?= verify_pending(Scope, Command, Data),
-        self() ! #dispatch_pending{scope = Scope},
-        modify_schema([#sop_add_pending{id = new, p = Wrapper}], S0)
-    end.
-
-verify_pending(site, Command, Data) when is_atom(Command), is_map(Data) ->
-    case Command of
-        _ ->
-            {error, unknown_site_command}
-    end;
-verify_pending(Scope = {db, DB}, Command, Data) when is_atom(Command), is_map(Data) ->
-    %% Note: this function runs before command is persisted, and while
-    %% server is running, so it's safe to use persistent term:
-    maybe
-        %% DB should exist, other than that we don't run additional
-        %% checks: backend should cancel actions it doesn't
-        %% understand.
-        #{} ?= get_db_schema(DB),
-        {ok, Data#{
-            start_time => os:system_time(millisecond),
-            scope => Scope,
-            command => Command
-        }}
-    else
-        _ -> {error, no_db}
-    end;
-verify_pending(_, _, _) ->
-    {error, badarg}.
-
-do_del_pending(Id, S0 = #s{sch = Pdata, pending = Tasks0}) ->
-    #{pending := Pend0} = Pdata,
-    case Pend0 of
-        #{Id := _} ->
-            Tasks = emqx_ds_pending_task_sup:terminate_task(Id, Tasks0),
-            ?tp(info, "Completed schema change", #{id => Id}),
-            {ok, S} = modify_schema([#sop_del_pending{id = Id}], S0),
-            S#s{pending = Tasks};
-        #{} ->
-            S0
-    end.
+do_list_pending(Scope, #s{}) ->
+    error(todo).
 
 -doc """
 Spawn executors for all pending tasks in the given DB.
 """.
 do_dispatch_db_pending(site, S) ->
     S;
-do_dispatch_db_pending({db, DB}, S = #s{pending = Tasks0, dbs = OpenDBs}) ->
-    case maps:is_key(DB, OpenDBs) of
-        true ->
-            Tasks = maps:fold(
-                fun(Id, TaskDefn, Acc) ->
-                    case Acc of
-                        #{Id := _} ->
-                            Acc;
-                        #{} ->
-                            emqx_ds_pending_task_sup:spawn_task(Id, TaskDefn, Acc)
-                    end
-                end,
-                Tasks0,
-                do_list_pending({db, DB}, S)
-            ),
-            S#s{pending = Tasks};
-        false ->
-            S
-    end.
+do_dispatch_db_pending({db, DB}, S = #s{open_dbs = OpenDBs}) ->
+    error(todo).
 
 -doc """
 Stop execution of all pending tasks that belong to a DB.
 """.
-shutdown_db_pending(DB, S = #s{pending = Tasks0}) ->
-    Tasks = maps:fold(
-        fun(Id, _, Acc) ->
-            emqx_ds_pending_task_sup:terminate_task(Id, Acc)
-        end,
-        Tasks0,
-        do_list_pending({db, DB}, S)
-    ),
-    S#s{pending = Tasks}.
+shutdown_db_pending(DB, S = #s{}) ->
+    error(todo).
 
 -spec do_ensure_db_schema(emqx_ds:db(), emqx_ds:backend(), db_schema(), s()) ->
     {reply, {ok, boolean(), db_schema()} | {error, _}, s()}.
@@ -859,7 +748,7 @@ do_ensure_db_schema(DB, Backend, NewDBSchema, S0) ->
         %% Handle creation path:
         {error, no_db_schema} ?= lookup_db_schema(DB, S0),
         {ok, _} ?= lookup_backend_cbm(Backend, S0),
-        {ok, S} ?= modify_schema([#sop_set_db{db = DB, schema = NewDBSchema}], S0),
+        {ok, S} ?= modify_schema(DB, NewDBSchema, S0),
         Reply = {ok, true, NewDBSchema},
         {reply, Reply, S}
     else
@@ -881,7 +770,7 @@ do_update_db_schema(DB, NewBackend, NewDBSchema, S0) ->
         {ok, OldDBSchema} ?= lookup_db_schema(DB, S0),
         #{backend := OldBackend} = OldDBSchema,
         true ?= OldBackend =:= NewBackend orelse {error, backend_cannot_be_changed},
-        {ok, S1} ?= modify_schema([#sop_set_db{db = DB, schema = NewDBSchema}], S0),
+        {ok, S1} ?= modify_schema(DB, NewDBSchema, S0),
         {ok, S} ?=
             do_add_pending(
                 {db, DB},
@@ -900,7 +789,7 @@ do_update_db_schema(DB, NewBackend, NewDBSchema, S0) ->
     end.
 
 -spec do_drop_db(emqx_ds:db(), s()) -> {reply, ok | {error, _}, s()}.
-do_drop_db(DB, S0 = #s{dbs = OpenDBs}) ->
+do_drop_db(DB, S0 = #s{open_dbs = OpenDBs}) ->
     maybe
         {ok, _} ?= lookup_db_schema(DB, S0),
         false ?= maps:is_key(DB, OpenDBs),
@@ -912,88 +801,6 @@ do_drop_db(DB, S0 = #s{dbs = OpenDBs}) ->
         {error, _} = Err ->
             {reply, Err, S0}
     end.
-
--spec do_update_cluster(schema_op(), s()) -> {ok, s()} | {error, _}.
-do_update_cluster(Op, S0 = #s{sch = Pstate}) ->
-    #{schema := #{cluster := OldCID, peers := Peers0, dbs := DBs}} = Pstate,
-    HasPeers = maps:size(Peers0) > 0,
-    case Op of
-        #sop_set_cluster{cluster = NewCID} when is_binary(OldCID), NewCID =:= singleton, HasPeers ->
-            {error, has_peers};
-        #sop_set_cluster{cluster = NewCID} when
-            is_binary(NewCID), is_binary(OldCID), NewCID =/= OldCID
-        ->
-            %% TODO: ask backends if they're ok with the change
-            %% instead of simply rejecting?
-            {error, cannot_change_cluster_existing_id};
-        #sop_set_peer{} when OldCID =:= singleton ->
-            {error, cannot_add_peers_while_in_singleton_mode};
-        _ ->
-            Ops = notify_cluster_change(Op, DBs),
-            modify_schema(Ops, S0)
-    end.
-
-notify_cluster_change(Op, DBs) ->
-    %% Create a pending event from the cluster update operation for
-    %% every open DB.
-    Prototype =
-        case Op of
-            #sop_set_cluster{cluster = Cluster} ->
-                #{
-                    command => set_cluster,
-                    cluster => Cluster
-                };
-            #sop_set_peer{peer = Site, state = State} ->
-                #{
-                    command => set_peer,
-                    site => Site,
-                    state => State
-                };
-            #sop_delete_peer{peer = Site} ->
-                #{
-                    command => delete_peer,
-                    site => Site
-                }
-        end,
-    %% Broadcast it to each DB schema:
-    PendingOps = maps:fold(
-        fun(DB, _, Acc) ->
-            self() ! #dispatch_pending{scope = {db, DB}},
-            SOp = #sop_add_pending{
-                id = new,
-                p = Prototype#{
-                    start_time => os:system_time(millisecond),
-                    scope => {db, DB}
-                }
-            },
-            [SOp | Acc]
-        end,
-        [],
-        DBs
-    ),
-    [Op | PendingOps].
-
--doc """
-A wrapper over `safe_add_l` that automatically puts the updated schema
-to the persistent term.
-""".
--spec modify_schema([schema_op()], s()) -> {ok, s()} | {error, _}.
-modify_schema(Ops, S = #s{sch = Pstate0}) ->
-    maybe
-        {ok, Pstate} ?= safe_add_l(?log_current, Ops, Pstate0),
-        persistent_term:put(?dsch_pt_schema, maps:get(schema, Pstate)),
-        {ok, S#s{sch = Pstate}}
-    end.
-
--spec ensure_site_schema(pstate() | ?empty_schema) -> pstate().
-ensure_site_schema(?empty_schema) ->
-    Site = binary:encode_hex(crypto:strong_rand_bytes(8)),
-    ?tp(notice, "Initializing durable storage for the first time", #{site => binary_to_list(Site)}),
-    Pstate = new_empty_pstate(1, Site, 1),
-    ok = dump(Pstate, ?log_current),
-    Pstate;
-ensure_site_schema(Pstate = #{ver := _}) ->
-    Pstate.
 
 -spec set_db_runtime(emqx_ds:db(), module(), ets:tid(), db_runtime_config()) -> ok.
 set_db_runtime(DB, CBM, GVars, RuntimeConf) ->
@@ -1012,11 +819,11 @@ erase_db_consts(DB) ->
     ok.
 
 -spec lookup_db_schema(emqx_ds:db(), s()) -> {ok, db_schema()} | {error, no_db_schema}.
-lookup_db_schema(DB, #s{sch = #{schema := #{dbs := DBs}}}) ->
-    case DBs of
-        #{DB := DBSchema} ->
+lookup_db_schema(DB, _) ->
+    case classy_table:lookup(?ptab_schema, DB) of
+        [DBSchema] ->
             {ok, DBSchema};
-        #{} ->
+        [] ->
             {error, no_db_schema}
     end.
 
