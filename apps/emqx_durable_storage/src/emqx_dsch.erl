@@ -724,9 +724,6 @@ do_register_backend(Alias, CBM, S = #s{backends = Backends0}) ->
 set_backend_cbms_pt(Backends) ->
     persistent_term:put(?dsch_pt_backends, Backends).
 
-do_list_pending(Scope, #s{}) ->
-    error(todo).
-
 -doc """
 Spawn executors for all pending tasks in the given DB.
 """.
@@ -748,7 +745,7 @@ do_ensure_db_schema(DB, Backend, NewDBSchema, S0) ->
         %% Handle creation path:
         {error, no_db_schema} ?= lookup_db_schema(DB, S0),
         {ok, _} ?= lookup_backend_cbm(Backend, S0),
-        {ok, S} ?= modify_schema(DB, NewDBSchema, S0),
+        {ok, S} ?= set_db_schema(DB, NewDBSchema, S0),
         Reply = {ok, true, NewDBSchema},
         {reply, Reply, S}
     else
@@ -770,7 +767,7 @@ do_update_db_schema(DB, NewBackend, NewDBSchema, S0) ->
         {ok, OldDBSchema} ?= lookup_db_schema(DB, S0),
         #{backend := OldBackend} = OldDBSchema,
         true ?= OldBackend =:= NewBackend orelse {error, backend_cannot_be_changed},
-        {ok, S1} ?= modify_schema(DB, NewDBSchema, S0),
+        {ok, S1} ?= set_db_schema(DB, NewDBSchema, S0),
         {ok, S} ?=
             do_add_pending(
                 {db, DB},
@@ -793,7 +790,7 @@ do_drop_db(DB, S0 = #s{open_dbs = OpenDBs}) ->
     maybe
         {ok, _} ?= lookup_db_schema(DB, S0),
         false ?= maps:is_key(DB, OpenDBs),
-        {ok, S} ?= modify_schema([#sop_drop_db{db = DB}], S0),
+        {ok, S} ?= del_db_schema(DB, S0),
         {reply, ok, S}
     else
         true ->
@@ -826,6 +823,16 @@ lookup_db_schema(DB, _) ->
         [] ->
             {error, no_db_schema}
     end.
+
+-spec set_db_schema(emqx_ds:db(), db_schema(), s()) -> {ok, s()}.
+set_db_schema(DB, Schema, S) ->
+    classy_table:write(?ptab_schema, DB, Schema),
+    {ok, S}.
+
+-spec del_db_schema(emqx_ds:db(), s()) -> {ok, s()}.
+del_db_schema(DB, S) ->
+    classy_table:delete(?ptab_schema, DB),
+    {ok, S}.
 
 -spec lookup_backend_cbm(emqx_ds:backend(), s()) -> {ok, module()} | {error, _}.
 lookup_backend_cbm(Backend, #s{backends = Backends}) ->
