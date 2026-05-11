@@ -158,6 +158,7 @@ If cluster ID wasn't previously created, it is initialized from
 -include("emqx_ds.hrl").
 -include("emqx_dsch.hrl").
 -include_lib("snabbkaffe/include/trace.hrl").
+-include_lib("classy/include/classy.hrl").
 
 -elvis([{elvis_style, no_single_clause_case, disable}]).
 
@@ -213,6 +214,7 @@ operations and other metadata.
 
 -define(ptab_schema, emqx_dsch_schema_tab).
 -define(ptab_pending, emqx_dsch_pending_tab).
+-define(seq_pending, emqx_dsch_pending_id).
 
 -type dbshard() :: {emqx_ds:db(), emqx_ds:shard()}.
 
@@ -233,7 +235,6 @@ operations and other metadata.
     db :: emqx_ds:db(), backend :: emqx_ds:backend(), schema :: db_schema()
 }).
 -record(call_add_pending, {scope :: pending_scope(), cmd :: atom(), data :: #{atom() => _}}).
--record(call_list_pending, {scope :: pending_scope() | all}).
 -record(call_open_db, {db :: emqx_ds:db(), conf :: db_runtime_config()}).
 -record(call_close_db, {db :: emqx_ds:db()}).
 -record(call_drop_db, {db :: emqx_ds:db()}).
@@ -399,7 +400,7 @@ get_db_schema(DB) ->
 
 -spec register_backend(emqx_ds:backend(), module()) -> ok | {error, _}.
 register_backend(Alias, CBM) when is_atom(Alias), is_atom(CBM) ->
-    gen_server:call(?SERVER, #call_register_backend{alias = Alias, cbm = CBM}).
+    gen_server:call(?SERVER, #call_register_backend{alias = Alias, cbm = CBM}, infinity).
 
 -spec get_backend_cbm(emqx_ds:backend()) -> {ok, module()} | {error, _}.
 get_backend_cbm(Backend) ->
@@ -416,22 +417,42 @@ Add a pending action.
 -spec add_pending(pending_scope(), Command, Data) -> ok | {error, _} when
     Command :: atom(), Data :: #{atom() => _}.
 add_pending(Scope, Command, Data) ->
-    error(todo).
+    gen_server:call(
+        ?SERVER, #call_add_pending{scope = Scope, cmd = Command, data = Data}, infinity
+    ).
 
 -spec list_pending() -> #{pending_id() => pending()}.
 list_pending() ->
-    error(todo).
+    list_pending(all).
 
 -spec list_pending(pending_scope() | all) -> #{pending_id() => pending()}.
 list_pending(Scope) ->
-    error(todo).
+    ets:foldl(
+        fun(#classy_kv{k = ID, v = Pending}, Acc) ->
+            Match =
+                case Pending of
+                    #{scope := Scope1} when Scope =:= all; Scope1 =:= Scope ->
+                        true;
+                    _ ->
+                        false
+                end,
+            case Match of
+                true ->
+                    Acc#{ID => Pending};
+                false ->
+                    Acc
+            end
+        end,
+        #{},
+        ?ptab_pending
+    ).
 
 -doc """
 Delete pending operation with the given ID.
 """.
 -spec del_pending(pending_id()) -> ok.
-del_pending(Id) ->
-    error(todo).
+del_pending(Id = {_, _}) ->
+    classy_table:delete(?ptab_pending, Id).
 
 -doc """
 If database schema wasn't present before, create schema it (equal to the
@@ -603,6 +624,13 @@ handle_call(#call_drop_db{db = DB}, _From, S) ->
     do_drop_db(DB, S);
 handle_call(#call_register_backend{alias = Alias, cbm = CBM}, _From, S) ->
     do_register_backend(Alias, CBM, S);
+handle_call(#call_add_pending{scope = Scope, cmd = Cmd, data = Data}, _From, S0) ->
+    case do_add_pending(Scope, Cmd, Data, S0) of
+        {ok, S} ->
+            {reply, ok, S};
+        Err = {error, _} ->
+            {reply, Err, S0}
+    end;
 handle_call(Call, From, S) ->
     ?tp(error, emqx_dsch_unkown_call, #{from => From, call => Call, state => S}),
     {reply, {error, unknown_call}, S}.
@@ -727,10 +755,30 @@ set_backend_cbms_pt(Backends) ->
 -doc """
 Spawn executors for all pending tasks in the given DB.
 """.
+-doc """
+Spawn executors for all pending tasks in the given DB.
+""".
 do_dispatch_db_pending(site, S) ->
     S;
-do_dispatch_db_pending({db, DB}, S = #s{open_dbs = OpenDBs}) ->
-    error(todo).
+do_dispatch_db_pending({db, DB}, S = #s{pending = Tasks0, open_dbs = OpenDBs}) ->
+    case maps:is_key(DB, OpenDBs) of
+        true ->
+            Tasks = maps:fold(
+                fun(Id, TaskDefn, Acc) ->
+                    case Acc of
+                        #{Id := _} ->
+                            Acc;
+                        #{} ->
+                            emqx_ds_pending_task_sup:spawn_task(Id, TaskDefn, Acc)
+                    end
+                end,
+                Tasks0,
+                list_pending({db, DB})
+            ),
+            S#s{pending = Tasks};
+        false ->
+            S
+    end.
 
 -doc """
 Stop execution of all pending tasks that belong to a DB.
@@ -843,6 +891,37 @@ lookup_backend_cbm(Backend, #s{backends = Backends}) ->
             {error, {no_such_backend, Backend}}
     end.
 
--spec perform_migration(#{ver := pos_integer(), _ => _}) -> pstate().
-perform_migration(Pstate = #{ver := 1}) ->
-    Pstate.
+-spec do_add_pending(pending_scope(), atom(), #{atom() => _}, s()) -> {ok, s()} | {error, _}.
+do_add_pending(Scope, Command, Data, S0) ->
+    maybe
+        {ok, Wrapper} ?= verify_pending(Scope, Command, Data),
+        self() ! #dispatch_pending{scope = Scope},
+        ID = classy_uid:site_unique_seq_tuple(?seq_pending),
+        classy_table:write(?ptab_pending, ID, Wrapper),
+        {ok, S0}
+    end.
+
+-spec verify_pending(pending_scope(), atom(), #{atom() => _}) -> {ok, map()} | {error, _}.
+verify_pending(site, Command, Data) when is_atom(Command), is_map(Data) ->
+    case Command of
+        _ ->
+            {error, unknown_site_command}
+    end;
+verify_pending(Scope = {db, DB}, Command, Data) when is_atom(Command), is_map(Data) ->
+    %% Note: this function runs before command is persisted, and while
+    %% server is running, so it's safe to use persistent term:
+    maybe
+        %% DB should exist, other than that we don't run additional
+        %% checks: backend should cancel actions it doesn't
+        %% understand.
+        #{} ?= get_db_schema(DB),
+        {ok, Data#{
+            start_time => os:system_time(millisecond),
+            scope => Scope,
+            command => Command
+        }}
+    else
+        _ -> {error, no_db}
+    end;
+verify_pending(_, _, _) ->
+    {error, badarg}.
