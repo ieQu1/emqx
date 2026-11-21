@@ -1,7 +1,7 @@
 %%--------------------------------------------------------------------
 %% Copyright (c) 2025-2026 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
--module(emqx_durable_timer_worker).
+-module(emqx_durable_timer_waker).
 -moduledoc """
 A process responsible for execution of the timers.
 
@@ -20,7 +20,7 @@ A process responsible for execution of the timers.
 
 ```
 
-### Active worker's timeline
+### Active waker's timeline
 
 ```                                         pending add apply_after
      pending gc trans                         ..................
@@ -66,8 +66,8 @@ Invariants:
 
 -type kind() :: active | {closed, started | dead_hand}.
 
--define(name(WORKER_KIND, TYPE, EPOCH, SHARD), {n, l, {?MODULE, WORKER_KIND, TYPE, EPOCH, SHARD}}).
--define(via(WORKER_KIND, TYPE, EPOCH, SHARD), {via, gproc, ?name(WORKER_KIND, TYPE, EPOCH, SHARD)}).
+-define(name(WAKER_KIND, TYPE, EPOCH, SHARD), {n, l, {?MODULE, WAKER_KIND, TYPE, EPOCH, SHARD}}).
+-define(via(WAKER_KIND, TYPE, EPOCH, SHARD), {via, gproc, ?name(WAKER_KIND, TYPE, EPOCH, SHARD)}).
 
 -record(call_apply_after, {
     k :: emqx_durable_timer:key(),
@@ -81,14 +81,14 @@ Invariants:
 -define(replay_complete, replay_complete).
 
 %% States:
-%%    Active workers replay `apply_after' timers that are added in the
+%%    Active wakers replay `apply_after' timers that are added in the
 %%    current (open) epoch for the node.
 -define(s_active, active).
 %%    Replayers for the closed epochs start in this state:
 -define(s_candidate(KIND), {candidate, KIND}).
-%%    Active worker for the closed epoch:
+%%    Active waker for the closed epoch:
 -define(s_leader(KIND), {leader, KIND}).
-%%    Standby worker that becomes candidate when the leader dies:
+%%    Standby waker that becomes candidate when the leader dies:
 -define(s_standby(KIND, REF), {standby, KIND, REF}).
 
 -type state() :: ?s_active | ?s_candidate(_) | ?s_leader(_) | ?s_standby(_, _).
@@ -101,9 +101,9 @@ Invariants:
     kind(), emqx_durable_timer:type(), emqx_durable_timer:epoch(), emqx_ds:shard()
 ) ->
     {ok, pid()}.
-start_link(WorkerKind, Type, Epoch, Shard) ->
+start_link(WakerKind, Type, Epoch, Shard) ->
     gen_statem:start_link(
-        ?via(WorkerKind, Type, Epoch, Shard), ?MODULE, [WorkerKind, Type, Epoch, Shard], []
+        ?via(WakerKind, Type, Epoch, Shard), ?MODULE, [WakerKind, Type, Epoch, Shard], []
     ).
 
 -spec apply_after(
@@ -155,16 +155,16 @@ apply_after(Type, Epoch, Key, Val, NotEarlierThan) when
 
 callback_mode() -> [handle_event_function, state_enter].
 
-init([WorkerKind, Type, Epoch, Shard]) ->
+init([WakerKind, Type, Epoch, Shard]) ->
     process_flag(trap_exit, true),
     logger:update_process_metadata(
-        #{kind => WorkerKind, type => Type, epoch => Epoch, shard => Shard}
+        #{kind => WakerKind, type => Type, epoch => Epoch, shard => Shard}
     ),
     CBM = emqx_durable_timer:get_cbm(Type),
-    ?tp(debug, ?tp_worker_started, #{
-        type => Type, epoch => Epoch, shard => Shard, kind => WorkerKind
+    ?tp(debug, ?tp_waker_started, #{
+        type => Type, epoch => Epoch, shard => Shard, kind => WakerKind
     }),
-    case WorkerKind of
+    case WakerKind of
         active ->
             emqx_durable_timer_dl:insert_epoch_marker(Shard, Epoch),
             D = #s{
@@ -178,7 +178,7 @@ init([WorkerKind, Type, Epoch, Shard]) ->
             },
             {ok, ?s_active, D};
         {closed, Kind} ->
-            pg:join(?workers_pg, {Kind, Type, Epoch, Shard}, self()),
+            pg:join(?wakers_pg, {Kind, Type, Epoch, Shard}, self()),
             D = #s{
                 type = Type,
                 cbm = CBM,
@@ -248,7 +248,7 @@ terminate(_Reason, _State, _D) ->
 %% Internal exports
 %%================================================================================
 
-%% @doc Display all active workers:
+%% @doc Display all active wakers:
 -spec ls() -> [{emqx_durable_timer:type(), emqx_durable_timer:epoch(), emqx_ds:shard(), pid()}].
 ls() ->
     MS = {{?name('$1', '$2', '$3', '$4'), '$5', '_'}, [], [{{'$1', '$2', '$3', '$4', '$5'}}]},
@@ -336,7 +336,7 @@ handle_wake_up(
     DSBatchSize =
         case State of
             ?s_active ->
-                %% Active worker sets up wakeup timers, so it can rely
+                %% Active waker sets up wakeup timers, so it can rely
                 %% on time-bounded batches:
                 {time, Bound, emqx_durable_timer:cfg_batch_size()};
             _ ->
@@ -388,7 +388,7 @@ complete_replay(
 pg_bcast(LeaderKind, #s{type = Type, epoch = Epoch, shard = Shard}, Msg) ->
     _ = [
         Peer ! Msg
-     || Peer <- pg:get_members(?workers_pg, {LeaderKind, Type, Epoch, Shard}),
+     || Peer <- pg:get_members(?wakers_pg, {LeaderKind, Type, Epoch, Shard}),
         Peer =/= self()
     ],
     ok.
@@ -551,7 +551,7 @@ Either create a new iterator at the very beginning of the timer stream,
 or return the existing iterator that points at the beginning of un-replayed timers.
 """.
 get_iterator(#s{shard = Shard, topic = Topic}) ->
-    %% This is the first start of the worker. Start from the beginning:
+    %% This is the first start of the waker. Start from the beginning:
     case emqx_ds:get_streams(?DB_GLOB, Topic, 0, #{shard => Shard}) of
         {[{_, Stream}], []} ->
             emqx_ds:make_iterator(?DB_GLOB, Stream, Topic, 0);

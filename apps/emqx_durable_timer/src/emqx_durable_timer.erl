@@ -15,7 +15,7 @@ Nodes ignore any timers with the types that aren't locally registered.
 Callback modules that implement timer types should be backward- and forward-compatible.
 If data stored in the timer key or value changes, a new timer type should be created.
 
-## State machine
+## Site State Machine
 
 ```
    (failed heartbeat)                       ,-----.
@@ -81,6 +81,21 @@ then it can use `emqx_durable_timer:retry(Reason)` API,
 which will throw a special type of error causing `emqx_durable_timer` workers to retry the callback after a while.
 However, due to the reasons stated above,
 this should be used with extreme care.
+
+### Timer replay
+
+Timers are executed with the help of two processes:
+
+- `emqx_durable_timer_worker` is responsible for the actual execution of the timer callbacks.
+  It also deletes already replayed timers from the DB.
+
+  Worker process reads the epoch topic just-in-time.
+
+- `emqx_durable_timer_waker` is responsible for keeping the current time
+  and notifying the worker about timers that are due.
+
+  Waker process reads the epoch topic ahead-of-time.
+
 """.
 
 -behaviour(gen_statem).
@@ -222,7 +237,7 @@ apply_after(Type, Key, Value, Delay) when ?is_valid_timer(Type, Key, Value, Dela
     NotEarlierThan = now_ms() + Delay,
     Epoch = epoch(),
     do_retry_rec(
-        fun() -> emqx_durable_timer_worker:apply_after(Type, Epoch, Key, Value, NotEarlierThan) end,
+        fun() -> emqx_durable_timer_waker:apply_after(Type, Epoch, Key, Value, NotEarlierThan) end,
         0
     ).
 
@@ -501,7 +516,7 @@ cfg_batch_size() ->
 start_active(Types, #s{this_epoch = Epoch}) ->
     Shards = emqx_durable_timer_dl:shards(),
     [
-        emqx_durable_timer_sup:start_worker(active, Type, Epoch, Shard)
+        emqx_durable_timer_sup:start_epoch(active, Type, Epoch, Shard)
      || Shard <- Shards,
         Type <- Types
     ],
@@ -511,8 +526,8 @@ start_closed(Types, Epochs) ->
     Shards = emqx_durable_timer_dl:shards(),
     [
         begin
-            ok = emqx_durable_timer_sup:start_worker({closed, started}, Type, Epoch, Shard),
-            ok = emqx_durable_timer_sup:start_worker({closed, dead_hand}, Type, Epoch, Shard)
+            ok = emqx_durable_timer_sup:start_epoch({closed, started}, Type, Epoch, Shard),
+            ok = emqx_durable_timer_sup:start_epoch({closed, dead_hand}, Type, Epoch, Shard)
         end
      || Epoch <- Epochs,
         Shard <- Shards,

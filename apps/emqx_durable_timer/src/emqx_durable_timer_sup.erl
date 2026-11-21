@@ -4,26 +4,30 @@
 -module(emqx_durable_timer_sup).
 -moduledoc """
 ```
-       worker worker ...
+   worker waker    worker waker
+       \   /          \   /
+   ?EPOCH_SUP ... ?EPOCH_SUP(one_for_all)
           \     |    /
-   pg     ?WORKERS_SUP  coordinator
-     \         |        /
-       ?SYSTEM(one_for_all)        % started on demand
-               |
-              ?TOP                 % root application supervisor
+     ?WORKERS_SUP(one_for_one)
+                |
+    pg          |   coordinator(emqx_durable_timer)
+      \         |         /
+       ?SYSTEM(one_for_all)         % started on demand
+                |
+               ?TOP                 % root application supervisor
 ```
 """.
 
 -behaviour(supervisor).
 
 %% API:
--export([ensure_running/0, start_top/0, stop_all_workers/0, start_worker/4]).
+-export([ensure_running/0, start_top/0, stop_all_workers/0, start_epoch/4]).
 
 %% behavior callbacks:
 -export([init/1]).
 
 %% internal exports:
--export([start_link_system/0, start_link_workers_sup/0]).
+-export([start_link_system/0, start_link_workers_sup/0, start_link_epoch_sup/4]).
 
 -export_type([]).
 
@@ -36,6 +40,12 @@
 -define(TOP, ?MODULE).
 -define(SYSTEM, emqx_durable_timer_system_sup).
 -define(WORKERS_SUP, emqx_durable_timer_workers).
+-record(epoch_sup, {
+    kind :: emqx_durable_timer_waker:kind(),
+    type :: emqx_durable_timer:type(),
+    epoch :: emqx_durable_timer:epoch(),
+    shard :: emqx_ds:shard()
+}).
 
 %%================================================================================
 %% API functions
@@ -53,13 +63,13 @@ stop_all_workers() ->
         Children
     ).
 
--spec start_worker(
-    emqx_durable_timer_worker:kind(),
+-spec start_epoch(
+    emqx_durable_timer_waker:kind(),
     emqx_durable_timer:type(),
     emqx_durable_timer:epoch(),
     emqx_ds:shard()
 ) -> ok.
-start_worker(Kind, Type, Epoch, Shard) ->
+start_epoch(Kind, Type, Epoch, Shard) ->
     case supervisor:start_child(?WORKERS_SUP, [Kind, Type, Epoch, Shard]) of
         {ok, _} ->
             ok;
@@ -102,6 +112,17 @@ start_link_system() ->
 -spec start_link_workers_sup() -> supervisor:startlink_ret().
 start_link_workers_sup() ->
     supervisor:start_link({local, ?WORKERS_SUP}, ?MODULE, ?WORKERS_SUP).
+
+-spec start_link_epoch_sup(
+    emqx_durable_timer_waker:kind(),
+    emqx_durable_timer:type(),
+    emqx_durable_timer:epoch(),
+    emqx_ds:shard()
+) -> supervisor:startlink_ret().
+start_link_epoch_sup(Kind, Type, Epoch, Shard) ->
+    supervisor:start_link(?MODULE, #epoch_sup{
+        kind = Kind, type = Type, epoch = Epoch, shard = Shard
+    }).
 
 %%================================================================================
 %% behavior callbacks
@@ -151,14 +172,37 @@ init(?WORKERS_SUP) ->
     Children = [
         #{
             id => worker,
-            start => {emqx_durable_timer_worker, start_link, []},
-            shutdown => 5_000,
-            type => worker,
+            start => {?MODULE, start_link_epoch_sup, []},
+            shutdown => infinity,
+            type => supervisor,
             restart => transient
         }
     ],
     SupFlags = #{
         strategy => simple_one_for_one,
+        intensity => 100,
+        period => 1
+    },
+    {ok, {SupFlags, Children}};
+init(#epoch_sup{kind = Kind, type = Type, epoch = Epoch, shard = Shard}) ->
+    Children = [
+        %% #{
+        %%     id => worker,
+        %%     start => {emqx_durable_timer_worker, start_link, [Kind, Type, Epoch, Shard]},
+        %%     shutdown => infinity,
+        %%     type => supervisor,
+        %%     restart => transient
+        %% }
+        #{
+            id => waker,
+            start => {emqx_durable_timer_waker, start_link, [Kind, Type, Epoch, Shard]},
+            shutdown => infinity,
+            type => supervisor,
+            restart => transient
+        }
+    ],
+    SupFlags = #{
+        strategy => one_for_all,
         intensity => 100,
         period => 1
     },
